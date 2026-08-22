@@ -197,6 +197,10 @@ def build_snapshot(*, seq, cfg, sample, motors, on_off, bx, by, bz,
             "pwm_min": cfg.pwm_min,
             "pwm_max": cfg.pwm_max,
             "gamma": cfg.gamma,
+            # Shipped so the GUI can draw its band ticks from the real
+            # table instead of hardcoding thresholds that would drift the
+            # moment this gets recalibrated.
+            "recruitment": [[row[0], row[1]] for row in cfg.recruitment_table],
             "baseline_progress": baseline_progress,
             "max_calibrated": bool(max_calibrated),
             "max_capture": max_capture,   # {"progress":f,"peak":f} while running

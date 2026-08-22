@@ -1,0 +1,712 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>eFlesh Haptic Feedback - Live</title>
+<!--
+  ============================================================
+  SINGLE FILE. NO CDN, NO WEB FONTS, NO EXTERNAL ASSETS.
+  Venue wifi will not exist. Everything needed is in this file.
+  ============================================================
+
+  This page COMPUTES NOTHING about the tactile signal or the haptic
+  encoding. Every number it draws arrives already computed from
+  pc/haptic_algorithm.py by way of pc/telemetry.py. The motor circles
+  render snapshot.motors, which is the exact command that was sent to the
+  haptic ESP32 on that frame -- not a recomputed value. If this page and
+  the motors ever disagree, that is a bug in the plumbing, not something
+  to paper over with client-side math.
+
+  Honesty rules baked into this UI, per docs/demo.md:
+    - M / N / S are RELATIVE deformation signals in raw MLX90393 delta
+      units. The word "force" and the unit "newton" appear nowhere.
+    - I is normalized against an EXPERIMENTALLY CALIBRATED maximum. If
+      that calibration has not been done, the page says so loudly rather
+      than implying I=1.0 means something.
+    - One eFlesh patch, one magnetometer, one contact site. No contact
+      localization, no per-finger mapping, no contact-area spread.
+    - SLIDING_OR_SHEAR is shown only in the debug panel, labelled as an
+      unvalidated diagnostic.
+    - The neural-intent block is explicitly a greyed-out placeholder.
+-->
+<style>
+:root{
+  --bg:#0a0e14;
+  --panel:#121821;
+  --panel2:#0e141c;
+  --line:#212c3a;
+  --line2:#2c3a4c;
+  --txt:#e6eef7;
+  --dim:#8395a8;
+  --dim2:#5c6b7d;
+  --acc:#37c8ff;
+  --ok:#3ddc84;
+  --bad:#e5533d;
+  --warn:#f5a524;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg);
+  color:var(--txt);
+  font:16px/1.4 ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  font-variant-numeric:tabular-nums;
+  padding:14px 16px 24px;
+}
+.num{font-variant-numeric:tabular-nums}
+
+/* ---------- header ---------- */
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding-bottom:12px;border-bottom:1px solid var(--line);margin-bottom:14px}
+h1{font-size:19px;font-weight:650;letter-spacing:.01em;white-space:nowrap}
+h1 span{color:var(--dim);font-weight:400}
+.badge{padding:5px 12px;border:1px solid var(--line2);border-radius:4px;
+  font-size:13px;font-weight:650;letter-spacing:.1em;white-space:nowrap}
+.badge.live{color:var(--ok);border-color:#1d5637}
+.badge.demo{color:var(--warn);border-color:#5c4413;background:#241b06}
+.badge.sensoronly{color:var(--acc);border-color:#17475c}
+.badge.lost{color:var(--bad);border-color:#5c1f16;background:#240b08}
+.grow{flex:1}
+.btns{display:flex;gap:8px;flex-wrap:wrap}
+button{
+  font:inherit;font-size:13px;font-weight:600;letter-spacing:.04em;
+  color:var(--txt);background:#18222e;border:1px solid var(--line2);
+  border-radius:4px;padding:9px 13px;cursor:pointer;white-space:nowrap;
+}
+button:hover:not(:disabled){border-color:var(--acc);color:#fff}
+button:disabled{opacity:.38;cursor:not-allowed}
+button.on{border-color:var(--acc);color:var(--acc);background:#0d2531}
+button.stop{border-color:#5c1f16;color:#ff9a8a}
+button.stop:hover{border-color:var(--bad);background:#2a0d09;color:#fff}
+
+/* ---------- banners ---------- */
+.banner{padding:12px 16px;border-radius:4px;margin-bottom:12px;
+  font-size:15px;display:flex;align-items:center;gap:14px}
+.banner.warn{background:#231903;border:1px solid #5c4413;color:#ffd894}
+.banner.act{background:#07222e;border:1px solid #17475c;color:#bfeaff}
+.banner b{font-weight:700;letter-spacing:.06em}
+.banner .prog{flex:1;height:10px;background:#0a1016;border:1px solid var(--line2);
+  border-radius:2px;overflow:hidden;min-width:120px}
+.banner .prog i{display:block;height:100%;background:var(--acc);width:0}
+
+/* ---------- grid ---------- */
+main{display:grid;gap:12px;grid-template-columns:repeat(12,1fr)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:12px 15px}
+.card h2{font-size:11px;font-weight:700;letter-spacing:.16em;color:var(--dim);
+  text-transform:uppercase;margin-bottom:10px}
+.note{font-size:11.5px;color:var(--dim2);line-height:1.45;margin-top:8px}
+
+.c-int{grid-column:span 7}
+.c-mot{grid-column:span 5}
+.c-graph{grid-column:span 12}
+.c-hand{grid-column:span 4}
+.c-pipe{grid-column:span 8}
+.c-status{grid-column:span 12}
+.c-debug{grid-column:span 12}
+@media (max-width:1100px){
+  .c-int,.c-mot,.c-hand,.c-pipe{grid-column:span 12}
+}
+/* On a wide demo screen, tuck the link status in beside the signal path
+   rather than giving it a full row: it keeps priorities 1-5 large while
+   fitting the whole dashboard on one 1080p screen with no scrolling. */
+@media (min-width:1300px){
+  .c-hand{grid-column:span 3}
+  .c-pipe{grid-column:span 6}
+  .c-status{grid-column:span 3}
+  .statrow{grid-template-columns:1fr 1fr}
+}
+
+/* ---------- intensity ---------- */
+.intwrap{display:flex;align-items:flex-end;gap:22px;margin-bottom:6px}
+#iPct{font-size:84px;line-height:.86;font-weight:300;letter-spacing:-.03em}
+#iPct sub{font-size:26px;font-weight:400;color:var(--dim);vertical-align:baseline;margin-left:4px}
+.bandbox{padding-bottom:8px}
+#iBand{font-size:36px;font-weight:650;letter-spacing:.02em;line-height:1}
+#iState{font-size:12px;letter-spacing:.14em;color:var(--dim);margin-top:7px}
+.bar{height:38px;background:var(--panel2);border:1px solid var(--line2);
+  border-radius:3px;position:relative;overflow:hidden;margin-top:4px}
+#iFill{height:100%;width:0;background:var(--acc);transition:width .06s linear}
+.bar .tick{position:absolute;top:0;bottom:0;width:1px;background:var(--line2)}
+.ticklabels{position:relative;height:15px;margin-top:3px}
+.ticklabels span{position:absolute;font-size:10px;color:var(--dim2);
+  transform:translateX(-50%);white-space:nowrap}
+
+/* ---------- motors ---------- */
+.motgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.mot{display:flex;align-items:center;gap:11px;padding:9px 11px;
+  background:var(--panel2);border:1px solid var(--line);border-radius:4px}
+.mot.act{border-color:#17475c;background:#091d27}
+.dial{width:44px;height:44px;flex:none}
+.motmeta .id{font-size:12px;color:var(--dim);letter-spacing:.1em;font-weight:600}
+.motmeta .pwm{font-size:22px;font-weight:600;line-height:1.15}
+.mot.idle .motmeta .pwm{color:var(--dim2);font-weight:400}
+
+/* ---------- graph ---------- */
+#graph{width:100%;height:138px;display:block}
+.glegend{display:flex;gap:20px;font-size:11.5px;color:var(--dim);margin-top:8px;flex-wrap:wrap}
+.glegend i{display:inline-block;width:16px;height:0;border-top:2px solid;
+  vertical-align:middle;margin-right:6px}
+
+/* ---------- pipeline ---------- */
+.pipe{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+.stage{flex:1;min-width:72px;text-align:center;padding:11px 5px;border:1px solid var(--line);
+  border-radius:4px;background:var(--panel2);font-size:11px;line-height:1.3;color:var(--dim2)}
+.stage.on{border-color:#17475c;background:#091d27;color:var(--acc)}
+.stage b{display:block;font-size:12px;font-weight:650;color:inherit}
+.stage.on b{color:var(--acc)}
+.arrow{flex:none;width:16px;display:flex;align-items:center;justify-content:center;
+  color:var(--line2);font-size:13px}
+.arrow.on{color:var(--acc)}
+.future{margin-top:12px;padding:11px 14px;border:1px dashed var(--line2);
+  border-radius:4px;background:#0c1118;color:var(--dim2)}
+.future b{display:block;font-size:12px;letter-spacing:.12em;color:#6b7b8d;margin-bottom:3px}
+.future .tag{float:right;font-size:10px;letter-spacing:.1em;border:1px solid var(--line2);
+  border-radius:3px;padding:2px 7px;color:var(--dim2)}
+
+/* ---------- status ---------- */
+.statrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:10px}
+.stat{padding:8px 11px;background:var(--panel2);border:1px solid var(--line);border-radius:4px}
+.stat .k{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--dim2)}
+.stat .v{font-size:15px;font-weight:600;margin-top:2px;display:flex;align-items:center;gap:7px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--bad);flex:none}
+.dot.ok{background:var(--ok)}
+.dot.idle{background:var(--dim2)}
+
+/* ---------- debug ---------- */
+details.c-debug{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:0}
+details summary{cursor:pointer;padding:12px 16px;font-size:11px;font-weight:700;
+  letter-spacing:.16em;color:var(--dim);text-transform:uppercase;list-style:none}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:"\25B8  ";color:var(--dim2)}
+details[open] summary::before{content:"\25BE  "}
+.dbg{padding:0 16px 16px;display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:9px 22px}
+.dbg div{display:flex;justify-content:space-between;gap:10px;font-size:13px;
+  border-bottom:1px solid var(--panel2);padding-bottom:5px}
+.dbg span:first-child{color:var(--dim)}
+.dbg span:last-child{font-weight:600}
+.dbggroup{grid-column:1/-1;font-size:10px;letter-spacing:.14em;color:var(--dim2);
+  text-transform:uppercase;margin-top:8px;border:0}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>e-Flesh Haptic Feedback <span>&middot; closed-loop tactile pathway</span></h1>
+  <span id="modeBadge" class="badge lost">CONNECTING</span>
+  <span class="grow"></span>
+  <div class="btns">
+    <button id="bCalBase">1. CALIBRATE BASELINE</button>
+    <button id="bCalMax">2. CALIBRATE MAXIMUM</button>
+    <button id="bDemo">START DEMO</button>
+    <button id="bLog">START LOG</button>
+    <button id="bStop" class="stop">STOP MOTORS</button>
+  </div>
+</header>
+
+<div id="banners"></div>
+
+<main>
+
+  <!-- 1. TACTILE INTENSITY -->
+  <section class="card c-int">
+    <h2>Tactile intensity</h2>
+    <div class="intwrap">
+      <div id="iPct">--<sub>%</sub></div>
+      <div class="bandbox">
+        <div id="iBand">NO CONTACT</div>
+        <div id="iState">STATE &mdash;</div>
+      </div>
+    </div>
+    <div class="bar" id="iBar"><div id="iFill"></div></div>
+    <div class="ticklabels" id="iTicks"></div>
+    <p class="note">
+      Normalized deformation <b>I</b> &isin; [0,1], measured against an experimentally
+      calibrated maximum for this patch. A relative signal, not a force measurement &mdash;
+      there is no force sensor in this pipeline. Band boundaries are the motor-recruitment
+      thresholds, so the label changes on the same frame a motor joins.
+    </p>
+  </section>
+
+  <!-- 2. SIX-MOTOR ARRAY -->
+  <section class="card c-mot">
+    <h2>Motor array &mdash; command sent to haptic ESP32</h2>
+    <div class="motgrid" id="motGrid"></div>
+    <p class="note">
+      Forearm layout M0 M1 / M2 M3 / M4 M5. Values are the exact
+      <code>M,&lt;m0&gt;..&lt;m5&gt;</code> PWM command sent on this frame, mirrored
+      from the engine &mdash; not recomputed here.
+      <span id="patLine"></span>
+    </p>
+  </section>
+
+  <!-- 3. MAGNITUDE vs TIME -->
+  <section class="card c-graph">
+    <h2>Filtered deformation magnitude &mdash; last 12 s</h2>
+    <canvas id="graph"></canvas>
+    <div class="glegend">
+      <span><i style="border-color:#37c8ff"></i>M (filtered)</span>
+      <span><i style="border-color:#f5a524;border-top-style:dashed"></i>contact threshold</span>
+      <span><i style="border-color:#8395a8;border-top-style:dashed"></i>calibrated maximum</span>
+      <span id="gScale" style="color:var(--dim2)"></span>
+    </div>
+    <p class="note">
+      <b>M = &radic;(dx&sup2;+dy&sup2;+dz&sup2;)</b> from baseline-subtracted, EMA-filtered
+      magnetometer deltas, in raw MLX90393 units. Relative deformation only &mdash; not newtons.
+    </p>
+  </section>
+
+  <!-- 4. HAND + PATCH -->
+  <section class="card c-hand">
+    <h2>Sensing site</h2>
+    <svg id="hand" viewBox="0 0 200 200" style="width:100%;max-width:172px;height:auto;display:block;margin:0 auto">
+      <!-- Stylized 3D-printed hand. ONE patch, ONE magnetometer: this
+           prototype has a single contact site and the graphic must not
+           imply per-finger sensing or contact localization. -->
+      <g fill="#161d27" stroke="#2c3a4c" stroke-width="1.6">
+        <rect x="62"  y="86"  width="76" height="74" rx="15"/>       <!-- palm -->
+        <rect x="66"  y="40"  width="17" height="52" rx="8.5"/>      <!-- index -->
+        <rect x="86"  y="30"  width="17" height="62" rx="8.5"/>      <!-- middle -->
+        <rect x="106" y="38"  width="17" height="54" rx="8.5"/>      <!-- ring -->
+        <rect x="126" y="52"  width="15" height="42" rx="7.5"/>      <!-- little -->
+        <rect x="36"  y="104" width="30" height="15" rx="7.5"
+              transform="rotate(-32 51 111)"/>                       <!-- thumb -->
+      </g>
+      <!-- the single e-Flesh patch -->
+      <rect id="patch" x="65" y="42" width="19" height="26" rx="8"
+            fill="#37c8ff" fill-opacity="0.06" stroke="#37c8ff"
+            stroke-opacity="0.35" stroke-width="1.8"/>
+      <circle id="mlx" cx="74.5" cy="55" r="2.6" fill="#37c8ff" fill-opacity="0.5"/>
+      <path d="M84 46 L150 34" stroke="#2c3a4c" stroke-width="1"/>
+      <text x="152" y="31" fill="#8395a8" font-size="8.5"
+            font-family="ui-sans-serif,system-ui,sans-serif">e-Flesh patch</text>
+      <text x="152" y="42" fill="#5c6b7d" font-size="7.5"
+            font-family="ui-sans-serif,system-ui,sans-serif">1 &times; MLX90393</text>
+    </svg>
+    <p class="note">
+      Single patch, single magnetometer, one contact site. This prototype does not
+      localize contact position or resolve contact area.
+    </p>
+  </section>
+
+  <!-- 5. PIPELINE -->
+  <section class="card c-pipe">
+    <h2>Signal path</h2>
+    <div class="pipe" id="pipe"></div>
+    <div class="future">
+      <span class="tag">NEXT INTEGRATION</span>
+      <b>NEURAL INTENT INTERFACE</b>
+      EEG / sEMG intent sensing and hand actuation &mdash; <b
+        style="display:inline;letter-spacing:0;color:#8395a8">not implemented, not part of this demo.</b>
+      This prototype validates the <i>afferent</i> (sensory feedback) half of the loop only:
+      what the hand touches, relayed to the user. The efferent (control) half is future work.
+    </div>
+  </section>
+
+  <!-- 6. STATUS -->
+  <section class="card c-status">
+    <h2>Link status</h2>
+    <div class="statrow">
+      <div class="stat"><div class="k">Sensor ESP32</div>
+        <div class="v"><span id="dSensor" class="dot"></span><span id="vSensor">&mdash;</span></div></div>
+      <div class="stat"><div class="k">Haptic ESP32</div>
+        <div class="v"><span id="dHaptic" class="dot"></span><span id="vHaptic">&mdash;</span></div></div>
+      <div class="stat"><div class="k">Sensor sample rate</div>
+        <div class="v"><span id="vRate">&mdash;</span></div></div>
+      <div class="stat"><div class="k">Link latency</div>
+        <div class="v"><span id="vLat">&mdash;</span></div></div>
+      <div class="stat"><div class="k">GUI stream</div>
+        <div class="v"><span id="vStream">&mdash;</span></div></div>
+      <div class="stat"><div class="k">Calibration</div>
+        <div class="v"><span id="dCal" class="dot idle"></span><span id="vCal">&mdash;</span></div></div>
+      <div class="stat"><div class="k">CSV log</div>
+        <div class="v"><span id="dLog" class="dot idle"></span><span id="vLog">off</span></div></div>
+    </div>
+  </section>
+
+  <!-- 7. DEBUG -->
+  <details class="c-debug">
+    <summary>Debug &mdash; raw field, baseline, deltas, features, calibration</summary>
+    <div class="dbg" id="dbg"></div>
+  </details>
+
+</main>
+
+<script>
+"use strict";
+
+/* ==================================================================
+   This script renders. It does not compute tactile or haptic values.
+   ================================================================== */
+
+var $ = function (id) { return document.getElementById(id); };
+var HIST_S = 12;          // graph window, seconds
+var STALE_MS = 1200;      // no frame for this long -> say so, do not fake it
+
+var snap = null;
+var hist = [];            // [{t, M}] for the graph
+var lastFrameAt = 0;
+var demoActive = false;
+var logActive = false;
+
+/* ---------- helpers ---------- */
+function f(v, d) {
+  if (v === null || v === undefined || (typeof v === "number" && !isFinite(v))) return "--";
+  return Number(v).toFixed(d === undefined ? 2 : d);
+}
+function send(cmd) {
+  fetch("/cmd", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({cmd: cmd})
+  }).catch(function () { /* engine gone; the LINK LOST banner already says so */ });
+}
+
+/* ---------- static build: motor tiles ---------- */
+(function buildMotors() {
+  var g = $("motGrid"), html = "";
+  for (var i = 0; i < 6; i++) {
+    html +=
+      '<div class="mot idle" id="mot' + i + '">' +
+        '<svg class="dial" viewBox="0 0 40 40">' +
+          '<circle cx="20" cy="20" r="16" fill="none" stroke="#2c3a4c" stroke-width="2.5"/>' +
+          '<circle id="arc' + i + '" cx="20" cy="20" r="16" fill="none" stroke="#37c8ff"' +
+            ' stroke-width="2.5" stroke-linecap="round" transform="rotate(-90 20 20)"' +
+            ' stroke-dasharray="100.5" stroke-dashoffset="100.5"/>' +
+          '<circle id="core' + i + '" cx="20" cy="20" r="7" fill="#37c8ff" fill-opacity="0"/>' +
+        '</svg>' +
+        '<div class="motmeta"><div class="id">M' + i + '</div>' +
+        '<div class="pwm" id="pwm' + i + '">0</div></div>' +
+      '</div>';
+  }
+  g.innerHTML = html;
+})();
+
+/* ---------- static build: pipeline ---------- */
+var STAGES = [
+  {b: "e-Flesh",   s: "patch"},
+  {b: "MLX90393",  s: "magnetometer"},
+  {b: "ESP32-S3",  s: "sensor node"},
+  {b: "Processing",s: "PC pipeline"},
+  {b: "Encoding",  s: "haptic encoder"},
+  {b: "6 Motors",  s: "coin ERM"},
+  {b: "User",      s: "forearm"}
+];
+(function buildPipe() {
+  var html = "";
+  for (var i = 0; i < STAGES.length; i++) {
+    if (i) html += '<div class="arrow" id="arw' + i + '">&#9654;</div>';
+    html += '<div class="stage" id="stg' + i + '"><b>' + STAGES[i].b + '</b>' +
+            STAGES[i].s + '</div>';
+  }
+  $("pipe").innerHTML = html;
+})();
+
+/* ---------- controls ---------- */
+$("bCalBase").onclick = function () { send("calibrate_baseline"); };
+$("bCalMax").onclick  = function () { send("calibrate_max"); };
+$("bStop").onclick    = function () { send("stop_motors"); };
+$("bDemo").onclick    = function () { send(demoActive ? "stop_demo" : "start_demo"); };
+$("bLog").onclick     = function () { send(logActive ? "stop_log" : "start_log"); };
+
+/* ---------- stream ---------- */
+var es = new EventSource("/stream");
+es.onmessage = function (ev) {
+  try { snap = JSON.parse(ev.data); } catch (e) { return; }
+  lastFrameAt = performance.now();
+
+  // Graph history is the one piece of state this page keeps, and it is
+  // just a buffer of values the engine already sent.
+  hist.push({t: snap.t, M: snap.features.M});
+  var cutoff = snap.t - HIST_S;
+  while (hist.length && hist[0].t < cutoff) hist.shift();
+
+  render(snap);
+};
+
+/* ---------- render ---------- */
+function render(s) {
+  var contact = s.state !== "NO_CONTACT";
+
+  /* --- mode badge --- */
+  var badge = $("modeBadge");
+  if (s.calibrating)       { badge.className = "badge demo";       badge.textContent = "CALIBRATING"; }
+  else if (s.demo.active)  { badge.className = "badge demo";       badge.textContent = "DEMO MODE"; }
+  else if (s.mode === "SENSOR-ONLY") { badge.className = "badge sensoronly"; badge.textContent = "SENSOR ONLY · MOTORS IDLE"; }
+  else                     { badge.className = "badge live";       badge.textContent = "LIVE"; }
+
+  demoActive = !!s.demo.active;
+  logActive  = !!s.log.active;
+  $("bDemo").textContent = demoActive ? "STOP DEMO" : "START DEMO";
+  $("bDemo").className   = demoActive ? "on" : "";
+  $("bLog").textContent  = logActive ? "STOP LOG" : "START LOG";
+  $("bLog").className    = logActive ? "on" : "";
+  $("bCalMax").disabled   = !!s.calibrating || !!s.cal.max_capture;
+  $("bCalBase").disabled  = !!s.calibrating || !!s.cal.max_capture;
+  // Sensor-only mode never opens a haptic transport, so these are dead there.
+  $("bStop").disabled = $("bDemo").disabled = (s.mode === "SENSOR-ONLY");
+
+  /* --- banners --- */
+  var b = [];
+  if (s.calibrating) {
+    b.push(banner("act", "STEP 1 &mdash; BASELINE",
+      "Leave the e-Flesh patch <b>untouched</b>. Sampling the resting field.",
+      s.cal.baseline_progress));
+  }
+  if (s.cal.max_capture) {
+    b.push(banner("act", "STEP 2 &mdash; MAXIMUM",
+      "Press <b>as hard as the demo will go</b> and hold. Peak M so far: " +
+      f(s.cal.max_capture.peak) + ".", s.cal.max_capture.progress));
+  }
+  if (!s.cal.max_calibrated && !s.cal.max_capture) {
+    // Without step 2 there is no calibrated top to the scale, so I is not
+    // meaningful. Say that outright rather than showing a confident number.
+    b.push(banner("warn", "MAXIMUM NOT CALIBRATED",
+      "<b>I is undefined</b> &mdash; the percentage and band below are measured against " +
+      "the built-in placeholder max_level of " + f(s.cal.max_level, 1) +
+      ", not this patch. Run step 2 before demonstrating.", null));
+  }
+  if (s.notice) b.push(banner("act", "ENGINE", s.notice, null));
+  if (s.demo.active) {
+    b.push(banner("warn", "DEMO MODE",
+      "Sensor input is <b>scripted, not live</b> &mdash; step " + s.demo.step_index + "/" +
+      s.demo.step_count + " (" + s.demo.step + "), " + f(s.demo.remaining_s, 1) + " s left. " +
+      "Values run through the real pipeline and the motors are really driven.", null));
+  }
+  $("banners").innerHTML = b.join("");
+
+  /* --- 1. intensity --- */
+  var pct = Math.max(0, Math.min(1, s.i)) * 100;
+  $("iPct").innerHTML = f(pct, 0) + "<sub>%</sub>";
+  $("iFill").style.width = pct + "%";
+  $("iBand").textContent = s.band;
+  $("iBand").style.color = contact ? "var(--acc)" : "var(--dim)";
+  $("iState").textContent = "STATE  " + s.state +
+    (s.events.onset ? "   ● CONTACT ONSET" : "") +
+    (s.events.release ? "   ○ RELEASE" : "");
+  drawTicks(s);
+
+  /* --- 2. motors --- */
+  var CIRC = 100.5;
+  for (var i = 0; i < 6; i++) {
+    var pwm = s.motors[i] | 0;
+    var on = pwm > 0;
+    var frac = pwm / 255;
+    $("mot" + i).className = "mot " + (on ? "act" : "idle");
+    $("pwm" + i).textContent = pwm;
+    $("arc" + i).setAttribute("stroke-dashoffset", CIRC * (1 - frac));
+    // Core opacity tracks PWM: an active motor reads as filled at a
+    // glance, and the fill depth is the amplitude.
+    $("core" + i).setAttribute("fill-opacity", on ? (0.25 + 0.75 * frac).toFixed(3) : "0");
+  }
+  var pat = s.pattern.continuous ? "continuous drive"
+          : (s.pattern.off_ms > 0
+              ? f(s.pattern.on_ms, 0) + " ms on / " + f(s.pattern.off_ms, 0) + " ms off"
+              : "idle");
+  $("patLine").innerHTML = "<br>Active: <b>" + s.active + " of 6</b> &nbsp;&middot;&nbsp; pattern: <b>" + pat + "</b>";
+
+  /* --- 3. graph --- */
+  drawGraph(s);
+
+  /* --- 4. hand --- */
+  var pOp = contact ? (0.10 + 0.72 * Math.max(0, Math.min(1, s.i))) : 0.05;
+  $("patch").setAttribute("fill-opacity", pOp.toFixed(3));
+  $("patch").setAttribute("stroke-opacity", contact ? "1" : "0.35");
+  $("patch").setAttribute("stroke-width", contact ? "2.4" : "1.8");
+  $("mlx").setAttribute("fill-opacity", contact ? "1" : "0.5");
+
+  /* --- 5. pipeline --- */
+  var live = !s.calibrating;
+  var anyMotor = s.motors.some(function (m) { return m > 0; });
+  var act = [
+    s.link.sensor_ok || s.demo.active,
+    s.link.sensor_ok || s.demo.active,
+    s.link.sensor_ok || s.demo.active,
+    live,
+    live && s.i > 0,
+    anyMotor,
+    anyMotor
+  ];
+  for (var j = 0; j < STAGES.length; j++) {
+    $("stg" + j).className = "stage" + (act[j] ? " on" : "");
+    if (j) $("arw" + j).className = "arrow" + ((act[j - 1] && act[j]) ? " on" : "");
+  }
+
+  /* --- 6. status --- */
+  setDot("dSensor", s.link.sensor_ok);
+  $("vSensor").textContent = s.link.sensor_ok ? "OK" : "LOST";
+  if (s.mode === "SENSOR-ONLY") {
+    $("dHaptic").className = "dot idle";
+    $("vHaptic").textContent = "not used";
+  } else {
+    setDot("dHaptic", s.link.haptic_ok);
+    $("vHaptic").textContent = (s.link.haptic_ok ? "OK" : "LOST") + " · " + s.link.transport;
+  }
+  $("vRate").textContent   = f(s.link.sensor_rate_hz, 1) + " Hz";
+  $("vLat").textContent    = s.link.haptic_latency_ms === null
+                              ? "not measured" : f(s.link.haptic_latency_ms, 1) + " ms";
+  $("vStream").textContent = f(s.link.stream_hz, 1) + " Hz";
+  $("dCal").className = "dot " +
+    ((s.calibrating || s.cal.max_capture) ? "" : (s.cal.max_calibrated ? "ok" : "idle"));
+  $("vCal").textContent = s.calibrating ? "step 1: baseline…"
+                          : s.cal.max_capture ? "step 2: capturing…"
+                          : (s.cal.max_calibrated ? "baseline + max" : "MAX MISSING");
+  $("dLog").className = "dot " + (s.log.active ? "ok" : "idle");
+  $("vLog").textContent = s.log.active ? (s.log.rows + " rows") : "off";
+
+  /* --- 7. debug --- */
+  drawDebug(s);
+}
+
+function banner(cls, title, body, prog) {
+  var h = '<div class="banner ' + cls + '"><b>' + title + '</b><span>' + body + '</span>';
+  if (prog !== null && prog !== undefined) {
+    h += '<span class="prog"><i style="width:' + (prog * 100).toFixed(1) + '%"></i></span>' +
+         '<span>' + (prog * 100).toFixed(0) + '%</span>';
+  }
+  return h + '</div>';
+}
+
+function setDot(id, ok) { $(id).className = "dot" + (ok ? " ok" : ""); }
+
+/* ---------- intensity band ticks, drawn from the engine's own table ---------- */
+var ticksKey = "";
+function drawTicks(s) {
+  var key = JSON.stringify(s.cal.recruitment);
+  if (key === ticksKey) return;      // static unless recalibrated
+  ticksKey = key;
+  var bar = $("iBar"), lab = $("iTicks");
+  var old = bar.querySelectorAll(".tick");
+  for (var k = 0; k < old.length; k++) old[k].remove();
+  var html = "";
+  s.cal.recruitment.forEach(function (row) {
+    var at = row[0], n = row[1];
+    if (at <= 0 || at >= 1) return;
+    var d = document.createElement("div");
+    d.className = "tick";
+    d.style.left = (at * 100) + "%";
+    bar.appendChild(d);
+    html += '<span style="left:' + (at * 100) + '%">' + n + (n === 1 ? " motor" : " motors") + '</span>';
+  });
+  lab.innerHTML = html;
+}
+
+/* ---------- graph ---------- */
+function drawGraph(s) {
+  var cv = $("graph");
+  var dpr = window.devicePixelRatio || 1;
+  var w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr || cv.height !== h * dpr) {
+    cv.width = w * dpr; cv.height = h * dpr;
+  }
+  var g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+
+  var pad = 4;
+  // Scale to whichever is larger: the calibrated max, or the live peak, so
+  // an over-max press is visible rather than clipped off the top.
+  var peak = 0;
+  for (var i = 0; i < hist.length; i++) if (hist[i].M > peak) peak = hist[i].M;
+  var top = Math.max(s.cal.max_level * 1.05, peak * 1.12, 1);
+  var y = function (m) { return h - pad - (m / top) * (h - 2 * pad); };
+  var x = function (t) { return ((t - (s.t - HIST_S)) / HIST_S) * w; };
+
+  $("gScale").textContent = "y-axis 0 – " + f(top, 0) + " (raw delta units)";
+
+  // reference lines
+  g.setLineDash([5, 4]);
+  g.lineWidth = 1;
+  g.strokeStyle = "#8395a8";
+  g.beginPath(); g.moveTo(0, y(s.cal.max_level)); g.lineTo(w, y(s.cal.max_level)); g.stroke();
+  g.strokeStyle = "#f5a524";
+  g.beginPath(); g.moveTo(0, y(s.cal.contact_level)); g.lineTo(w, y(s.cal.contact_level)); g.stroke();
+  g.setLineDash([]);
+
+  if (hist.length > 1) {
+    g.strokeStyle = "#37c8ff";
+    g.lineWidth = 2;
+    g.lineJoin = "round";
+    g.beginPath();
+    g.moveTo(x(hist[0].t), y(hist[0].M));
+    for (var j = 1; j < hist.length; j++) g.lineTo(x(hist[j].t), y(hist[j].M));
+    g.stroke();
+
+    // leading dot, so the "now" edge is obvious while it scrolls
+    var last = hist[hist.length - 1];
+    g.fillStyle = "#37c8ff";
+    g.beginPath(); g.arc(x(last.t), y(last.M), 3, 0, 6.2832); g.fill();
+  }
+}
+
+/* ---------- debug ---------- */
+function drawDebug(s) {
+  function row(k, v) { return "<div><span>" + k + "</span><span>" + v + "</span></div>"; }
+  function grp(t) { return '<div class="dbggroup">' + t + "</div>"; }
+  $("dbg").innerHTML =
+    grp("raw field (MLX90393, baseline NOT subtracted)") +
+    row("Bx", f(s.b.x)) + row("By", f(s.b.y)) + row("Bz", f(s.b.z)) +
+    grp("baseline (median of untouched samples)") +
+    row("baseline Bx", f(s.cal.baseline[0])) +
+    row("baseline By", f(s.cal.baseline[1])) +
+    row("baseline Bz", f(s.cal.baseline[2])) +
+    grp("deltas (baseline-subtracted, deadbanded, EMA-filtered)") +
+    row("dx", f(s.d.x)) + row("dy", f(s.d.y)) + row("dz", f(s.d.z)) +
+    grp("features — relative deformation, raw delta units, NOT newtons") +
+    row("M  total", f(s.features.M)) +
+    row("N  |dz| normal proxy", f(s.features.N)) +
+    row("S  lateral proxy", f(s.features.S)) +
+    row("dM rate", f(s.features.dM)) +
+    row("HF energy", f(s.features.hf)) +
+    grp("state & intensity") +
+    row("state", s.state) +
+    row("band", s.band) +
+    row("I", f(s.i, 4)) +
+    row("active motors", s.active + " / 6") +
+    row("pattern", s.pattern.continuous ? "continuous"
+        : f(s.pattern.on_ms, 0) + " / " + f(s.pattern.off_ms, 0) + " ms") +
+    grp("calibration parameters (calibration.json)") +
+    row("contact_level", f(s.cal.contact_level)) +
+    row("max_level", f(s.cal.max_level) + (s.cal.max_calibrated ? "" : "  (default)")) +
+    row("deadband", f(s.cal.deadband)) +
+    row("alpha (EMA)", f(s.cal.alpha, 3)) +
+    row("pwm_min / max", s.cal.pwm_min + " / " + s.cal.pwm_max) +
+    row("gamma", f(s.cal.gamma, 2)) +
+    grp("stream") +
+    row("seq", s.seq) +
+    row("mode", s.mode) +
+    row("log file", s.log.path || "—") +
+    grp("diagnostic only — not validated in V1") +
+    row("SLIDING_OR_SHEAR", s.state === "SLIDING_OR_SHEAR"
+        ? "labelled now (unvalidated)" : "not labelled");
+}
+
+/* ---------- link supervision: never leave stale numbers looking live ---------- */
+function markLost(why) {
+  var badge = $("modeBadge");
+  badge.className = "badge lost";
+  badge.textContent = why;
+  for (var j = 0; j < STAGES.length; j++) {
+    $("stg" + j).className = "stage";
+    if (j) $("arw" + j).className = "arrow";
+  }
+  setDot("dSensor", false); setDot("dHaptic", false);
+}
+es.onerror = function () {
+  markLost("ENGINE UNREACHABLE");
+  $("banners").innerHTML = banner("warn", "LINK LOST",
+    "No connection to haptic_engine.py. The browser will keep retrying. " +
+    "The terminal dashboard is the fallback. Motors stop on their own within " +
+    "the firmware watchdog window if the PC stopped sending.", null);
+};
+setInterval(function () {
+  if (lastFrameAt && performance.now() - lastFrameAt > STALE_MS && es.readyState === 1) {
+    markLost("STREAM STALLED");
+  }
+}, 400);
+
+window.addEventListener("resize", function () { if (snap) drawGraph(snap); });
+</script>
+</body>
+</html>
