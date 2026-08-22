@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated data / logs (raw CSVs are per-run, not source)
+demo_logs/
+data/*.csv
+logs/
+*.log
+
+# Local configuration / calibration output
+.env
+calibration.json
+
+# Arduino build artifacts
+*.hex
+*.elf
+*.bin
+build/
+.pio/
+
+# Keep placeholder files
+!data/.gitkeep
