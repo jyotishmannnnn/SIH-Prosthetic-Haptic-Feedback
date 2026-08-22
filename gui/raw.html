@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>eFlesh telemetry - raw</title>
+</head>
+<body style="font-family:monospace;font-size:13px;white-space:pre-wrap;margin:12px">
+<!--
+  MILESTONE 3: data-path proof. Deliberately unstyled.
+
+  Purpose: confirm that pressing the eFlesh patch makes numbers move in a
+  browser. If M and I below change when you press, the whole chain
+  (MLX90393 -> sensor ESP32 -> serial -> haptic_algorithm -> telemetry
+  hub -> SSE -> browser) is working, and everything after this is
+  presentation. If they do not move, fix it here, not in the dashboard.
+
+  Kept in the repo after the dashboard exists: when the dashboard looks
+  wrong, this page answers "is it the data or the drawing?".
+-->
+<b>eFlesh telemetry - raw stream</b>  (<a href="/">dashboard</a>)
+<hr>
+<div id="hdr">connecting to /stream ...</div>
+<hr>
+<div id="key"></div>
+<hr>
+<div id="json"></div>
+
+<script>
+"use strict";
+var hdr = document.getElementById("hdr");
+var key = document.getElementById("key");
+var out = document.getElementById("json");
+
+var frames = 0;
+var lastAt = 0;
+var rate = 0;
+var rateFrames = 0;
+var rateT = performance.now();
+
+function pad(s, n) { s = String(s); while (s.length < n) s = " " + s; return s; }
+function f(v, d) { return (v === null || v === undefined) ? "--" : Number(v).toFixed(d === undefined ? 2 : d); }
+
+var es = new EventSource("/stream");
+
+es.onopen = function () { hdr.textContent = "STREAM OPEN"; };
+
+es.onerror = function () {
+  hdr.textContent = "STREAM LOST - EventSource will retry automatically."
+    + " Is haptic_engine.py still running with --gui?";
+};
+
+es.onmessage = function (ev) {
+  var s;
+  try { s = JSON.parse(ev.data); } catch (e) { return; }
+
+  frames++;
+  rateFrames++;
+  var now = performance.now();
+  if (now - rateT >= 1000) {
+    rate = rateFrames * 1000 / (now - rateT);
+    rateFrames = 0;
+    rateT = now;
+  }
+  lastAt = now;
+
+  hdr.textContent =
+    "STREAM OPEN   frames=" + frames +
+    "   browser_rx=" + f(rate, 1) + " Hz" +
+    "   server_push=" + f(s.link.stream_hz, 1) + " Hz" +
+    "   seq=" + s.seq;
+
+  // The few numbers that actually prove the data path. Press the patch:
+  // M and I must move. Everything else is detail.
+  key.textContent = [
+    "mode          " + s.mode + (s.calibrating ? "  (CALIBRATING)" : ""),
+    "state         " + s.state + "   band=" + s.band,
+    "",
+    "B  raw        x=" + pad(f(s.b.x), 10) + "  y=" + pad(f(s.b.y), 10) + "  z=" + pad(f(s.b.z), 10),
+    "d  filtered   x=" + pad(f(s.d.x), 10) + "  y=" + pad(f(s.d.y), 10) + "  z=" + pad(f(s.d.z), 10),
+    "",
+    "M             " + pad(f(s.features.M), 10) + "   <-- relative deformation, NOT newtons",
+    "I             " + pad(f(s.i, 3), 10) + "   <-- normalized [0,1]",
+    "",
+    "motors        [" + s.motors.join(", ") + "]   active=" + s.active,
+    "pattern       " + (s.pattern.continuous ? "continuous"
+                        : (f(s.pattern.on_ms, 0) + " ms ON / " + f(s.pattern.off_ms, 0) + " ms OFF")),
+    "",
+    "sensor link   " + (s.link.sensor_ok ? "OK" : "LOST") + "   " + f(s.link.sensor_rate_hz, 1) + " Hz",
+    "haptic link   " + (s.link.haptic_ok ? "OK" : "LOST") + "   transport=" + s.link.transport +
+      "   latency=" + (s.link.haptic_latency_ms === null ? "n/a" : f(s.link.haptic_latency_ms, 1) + " ms")
+  ].join("\n");
+
+  out.textContent = JSON.stringify(s, null, 2);
+};
+
+// If frames stop arriving but the socket stays open, say so rather than
+// leaving stale numbers on screen looking live.
+setInterval(function () {
+  if (lastAt && performance.now() - lastAt > 1500 && es.readyState === 1) {
+    hdr.textContent = "STREAM OPEN but NO FRAMES for >1.5s"
+      + "  (engine loop stalled, or calibration blocking on terminal input?)";
+  }
+}, 500);
+</script>
+</body>
+</html>

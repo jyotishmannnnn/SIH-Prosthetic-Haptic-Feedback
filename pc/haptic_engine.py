@@ -20,6 +20,11 @@ Usage:
     python haptic_engine.py --simulate --haptic-port COM8
     python haptic_engine.py --sensor-only --sensor-port COM7
 
+    # Add the browser dashboard to full or sensor-only mode. The terminal
+    # dashboard keeps running either way -- it is the fallback if the
+    # browser dies mid-demo.
+    python haptic_engine.py --sensor-port COM7 --haptic-port COM8 --gui
+
     # Alternate haptic transports (see transports/, docs/transport-options.md).
     # USB is the only one tested against real hardware.
     python haptic_engine.py --sensor-port COM7 --transport wifi
@@ -51,6 +56,7 @@ from haptic_algorithm import (
     simulate as simulate_magnitudes,
 )
 from transports import get_transport, MotorCommand, get_default_transport_name
+import telemetry
 
 BAUD_RATE = 115200
 SERIAL_READ_TIMEOUT_S = 0.01
@@ -63,6 +69,18 @@ DASHBOARD_HZ = 8
 
 LOG_DIR = "demo_logs"
 DEFAULT_CALIBRATION_FILE = "calibration.json"
+
+DEMO_FEED_HZ = 100        # rate scripted demo input is fed to the pipeline,
+                          # matching the real sensor's ~100 Hz stream
+HAPTIC_PING_S = 2.0       # PING interval, so the GUI's latency readout is real
+EVENT_STICKY_S = 0.2      # how long a one-tick onset/release stays visible to
+                          # a 30 Hz GUI (the event itself is not extended)
+
+
+def idle_sample():
+    """A zeroed TactileSample, for the window before the first real one."""
+    return TactileSample(0, 0, 0, 0, 0, 0, 0, 0,
+                         TactileState.NO_CONTACT, 0.0, False, False)
 
 
 # ======================================================================
@@ -137,6 +155,16 @@ class SensorReader(threading.Thread):
             pass
 
 
+def _drain_queue(q):
+    """Empty a queue into a list without blocking."""
+    out = []
+    while True:
+        try:
+            out.append(q.get_nowait())
+        except queue.Empty:
+            return out
+
+
 class KeyboardReader(threading.Thread):
     """Line-buffered keyboard input (type a command then Enter). Kept
     simple and cross-platform instead of raw single-keypress capture."""
@@ -167,28 +195,68 @@ class KeyboardReader(threading.Thread):
 # ======================================================================
 
 class DemoLogger:
+    """The one and only CSV writer. Schema is haptic_algorithm.LOG_COLUMNS.
+
+    start()/stop() exist so the GUI's log buttons drive THIS writer at
+    runtime rather than a second logger being added alongside it. Each
+    start() opens a new timestamped file; stop() closes it cleanly.
+    """
+
+    FLUSH_EVERY = 200   # ~2 s at 100 Hz, so a crash loses very little
+
     def __init__(self, enabled, log_dir=LOG_DIR):
-        self.enabled = enabled
+        self.log_dir = log_dir
+        self.enabled = False
         self.file = None
         self.writer = None
-        if not enabled:
-            return
-        os.makedirs(log_dir, exist_ok=True)
+        self.path = None
+        self.rows = 0
+        if enabled:
+            self.start()
+
+    def start(self):
+        """Open a fresh CSV. No-op if already logging, so a double click
+        in the GUI cannot orphan a half-written file."""
+        if self.enabled:
+            return self.path
+        os.makedirs(self.log_dir, exist_ok=True)
         fname = time.strftime("%Y%m%d_%H%M%S") + ".csv"
-        path = os.path.join(log_dir, fname)
+        path = os.path.join(self.log_dir, fname)
         self.file = open(path, "w", newline="")
         self.writer = csv.writer(self.file)
         self.writer.writerow(LOG_COLUMNS)
         self.path = path
+        self.rows = 0
+        self.enabled = True
+        return path
 
     def log(self, row):
         if not self.enabled:
             return
         self.writer.writerow(row)
+        self.rows += 1
+        if self.rows % self.FLUSH_EVERY == 0:
+            try:
+                self.file.flush()
+            except Exception:
+                pass
+
+    def stop(self):
+        if not self.enabled:
+            return None
+        closed = self.path
+        self.enabled = False
+        try:
+            self.file.flush()
+            self.file.close()
+        except Exception:
+            pass
+        self.file = None
+        self.writer = None
+        return closed
 
     def close(self):
-        if self.enabled and self.file:
-            self.file.close()
+        self.stop()
 
 
 # ======================================================================
@@ -202,6 +270,139 @@ def load_or_default_config(path):
     print(f"No calibration file at {path} — using built-in defaults "
           f"(placeholders, run --calibrate to tune for your eFlesh patch).")
     return HapticConfig()
+
+
+class MaxCapture:
+    """Calibration step 2: capture the peak M of the hardest press the demo
+    will use, and make that I = 1.0.
+
+    This step is not optional. contact_level alone only says where contact
+    starts; without max_level the normalized intensity I has no defined top
+    and every downstream mapping (PWM curve, pulse table, recruitment) is
+    reading against an arbitrary scale.
+
+    Writes into the same calibration.json HapticConfig already uses -- no
+    second config file, and never in newtons.
+    """
+
+    DURATION_S = 4.0
+
+    def __init__(self, cfg: HapticConfig, path):
+        self.cfg = cfg
+        self.path = path
+        self.t0 = time.monotonic()
+        self.peak = 0.0
+        self.done = False
+
+    def feed(self, m):
+        if self.done:
+            return
+        if m > self.peak:
+            self.peak = m
+        if time.monotonic() - self.t0 >= self.DURATION_S:
+            self.done = True
+
+    def progress(self):
+        return min(1.0, (time.monotonic() - self.t0) / self.DURATION_S)
+
+    def status(self):
+        return {"progress": self.progress(), "peak": self.peak}
+
+    def commit(self):
+        """Returns (ok, message). Refuses to save a peak that would make
+        the intensity scale nonsense."""
+        if self.peak <= self.cfg.contact_level:
+            return False, (f"peak M {self.peak:.2f} is at or below contact_level "
+                           f"{self.cfg.contact_level:.2f} - press harder; nothing saved")
+        self.cfg.max_level = self.peak
+        self.cfg.save(self.path)
+        return True, f"max_level = {self.peak:.2f} saved to {self.path}"
+
+
+class DemoScript:
+    """Scripted walk through the intensity bands, for a hands-off demo.
+
+    What this synthesizes is SENSOR INPUT -- Bx/By/Bz -- and nothing else.
+    Each step's target is converted back into a synthetic Bz offset and
+    pushed through the real TactilePipeline, so the deadband, EMA filter,
+    feature extraction, state machine, intensity normalization and haptic
+    encoder running in demo mode are exactly the ones running live. No
+    pipeline stage is reimplemented here and no motor value is invented.
+
+    Live mode never constructs this class. While it is running, both the
+    terminal dashboard and the GUI are badged DEMO MODE.
+    """
+
+    # (label, target intensity, seconds). The targets sit inside each band
+    # of the default recruitment_table (1/2/4/6 motors at .05/.25/.5/.75),
+    # so the walk visibly recruits motors one group at a time.
+    STEPS = [
+        ("NO CONTACT", 0.00, 3.0),
+        ("LIGHT",      0.15, 4.0),
+        ("MEDIUM",     0.35, 4.0),
+        ("STRONG",     0.60, 4.0),
+        ("MAXIMUM",    0.95, 4.0),
+        ("RELEASE",    0.00, 3.0),
+    ]
+
+    def __init__(self, cfg: HapticConfig):
+        self.cfg = cfg
+        self.idx = 0
+        self.t0 = time.monotonic()
+        self.done = False
+
+    def _target_m(self, intensity):
+        """Pick a synthetic input magnitude that will land on the given
+        intensity. This chooses an INPUT; TactilePipeline still computes
+        the actual I from it, through the normal Stage 1-4 path."""
+        if intensity <= 0:
+            return 0.0
+        span = max(self.cfg.max_level - self.cfg.contact_level, 1e-6)
+        return self.cfg.contact_level + intensity * span
+
+    def sample(self):
+        """Next (bx, by, bz) for pipeline.process(), or None when finished."""
+        if self.done:
+            return None
+        _, intensity, dur = self.STEPS[self.idx]
+        if time.monotonic() - self.t0 >= dur:
+            self.idx += 1
+            self.t0 = time.monotonic()
+            if self.idx >= len(self.STEPS):
+                self.done = True
+                return None
+            _, intensity, dur = self.STEPS[self.idx]
+        cfg = self.cfg
+        # Z axis only: dx = dy = 0, so the pipeline sees a clean
+        # normal-ish deformation and S stays at zero.
+        return (cfg.baseline_bx, cfg.baseline_by,
+                cfg.baseline_bz + self._target_m(intensity))
+
+    def status(self):
+        label, intensity, dur = self.STEPS[min(self.idx, len(self.STEPS) - 1)]
+        return {
+            "active": not self.done,
+            "step": label,
+            "step_index": self.idx + 1,
+            "step_count": len(self.STEPS),
+            "remaining_s": max(0.0, dur - (time.monotonic() - self.t0)),
+            "target_i": intensity,
+        }
+
+
+def start_hub(args):
+    """Bring up the GUI server, or return None if --gui was not passed."""
+    if not getattr(args, "gui", False):
+        return None
+    hub = telemetry.TelemetryHub(host=args.gui_host, port=args.gui_port)
+    url = hub.start()
+    print(f"GUI dashboard: {url}")
+    print(f"Data-path check (raw JSON): {url}raw")
+    if args.gui_host not in ("127.0.0.1", "localhost"):
+        print(f"[WARN] GUI bound to {args.gui_host}, reachable from the network. "
+              f"This endpoint can start and stop motors.")
+    time.sleep(1.5)   # leave the URL readable before the dashboard repaints
+    return hub
 
 
 def auto_calibrate_baseline(sensor: SensorReader, cfg: HapticConfig):
@@ -223,7 +424,7 @@ def auto_calibrate_baseline(sensor: SensorReader, cfg: HapticConfig):
 # ======================================================================
 
 def render_dashboard(sensor_rate, bx, by, bz, sample, motors, on_off,
-                      sensor_ok, haptic_ok, mode_label):
+                      sensor_ok, haptic_ok, mode_label, gui_url=None):
     def bar(v, vmax, width=16):
         filled = int(round(max(0.0, min(1.0, v / vmax)) * width)) if vmax > 0 else 0
         return "#" * filled + "." * (width - filled)
@@ -257,6 +458,8 @@ def render_dashboard(sensor_rate, bx, by, bz, sample, motors, on_off,
     lines.append(f"Haptic connection: {'OK' if haptic_ok else 'LOST'}")
     lines.append("")
     lines.append("Keys: [b]=recalibrate baseline  [s]=stop motors  [q]=quit")
+    if gui_url:
+        lines.append(f"GUI:  {gui_url}   (raw: {gui_url}raw)")
 
     sys.stdout.write("\033[H\033[J")
     sys.stdout.write("\n".join(lines) + "\n")
@@ -277,7 +480,14 @@ def run_full_mode(args):
     keys = KeyboardReader()
     keys.start()
 
+    # max_level is only meaningful if it came from a real press. Treat a
+    # pre-existing calibration.json as calibrated, and anything else as
+    # built-in defaults, so the GUI can say so plainly instead of
+    # implying I=1.0 means something it does not.
+    max_calibrated = os.path.exists(args.calibration_file)
     cfg = load_or_default_config(args.calibration_file)
+    hub = start_hub(args)
+    gui_url = hub.url if hub is not None else None
 
     if args.calibrate:
         print("Running guided calibration wizard...")
@@ -298,22 +508,115 @@ def run_full_mode(args):
     last_sample = None
     last_on_off = (0, 0)
     last_motors = [0] * NUM_MOTORS   # the last command ACTUALLY SENT to the haptic ESP32
+    last_ping = 0.0
+    onset_at = -99.0
+    release_at = -99.0
+    seq = 0
+    demo = None
+    demo_next = 0.0
+    max_capture = None
+    notice = None            # (text, monotonic_ts), surfaced in the GUI
     running = True
 
     try:
         while running:
-            # ---- keyboard commands ----
-            while not keys.out_queue.empty():
-                cmd = keys.out_queue.get()
-                if cmd == "b":
+            # ---- commands: keystrokes and GUI buttons take the SAME path ----
+            pending = [(c, {}) for c in _drain_queue(keys.out_queue)]
+            if hub is not None:
+                pending.extend(hub.drain_commands())
+
+            for cmd, _cargs in pending:
+                if cmd in ("b", "calibrate_baseline"):
                     print("\nRecalibrating baseline. DO NOT TOUCH the eFlesh...")
                     haptic.stop()
+                    last_motors, last_on_off = [0] * NUM_MOTORS, (0, 0)
+                    max_capture = None
                     calibrator.begin()
                     calibrating = True
-                elif cmd == "s":
+                elif cmd in ("s", "stop_motors"):
                     haptic.stop()
+                    last_motors, last_on_off = [0] * NUM_MOTORS, (0, 0)
+                    demo = None
+                    notice = ("motors stopped", time.monotonic())
+                elif cmd == "calibrate_max":
+                    if calibrating:
+                        notice = ("finish baseline calibration first",
+                                  time.monotonic())
+                    else:
+                        max_capture = MaxCapture(cfg, args.calibration_file)
+                        print("\nMAX CALIBRATION: press as hard as the demo "
+                              "will go, and hold...")
+                elif cmd == "start_demo":
+                    demo = DemoScript(cfg)
+                    demo_next = 0.0
+                elif cmd == "stop_demo":
+                    demo = None
+                    haptic.stop()
+                    last_motors, last_on_off = [0] * NUM_MOTORS, (0, 0)
+                elif cmd == "start_log":
+                    path = logger.start()
+                    notice = (f"logging to {path}", time.monotonic())
+                elif cmd == "stop_log":
+                    closed = logger.stop()
+                    notice = ((f"log closed: {closed}" if closed else "not logging"),
+                              time.monotonic())
                 elif cmd == "q":
                     running = False
+
+            now = time.monotonic()
+
+            # ---- sensor input: real samples, or scripted input in demo mode ----
+            # encoder.update() is deliberately NOT called in here. It is
+            # stateful (wall-clock pulse phase + one-shot transient window),
+            # so it is called exactly ONCE per send tick below. That single
+            # result is authoritative for the motor command, the CSV row, the
+            # terminal dashboard and the GUI snapshot alike -- calling
+            # update() here as well would produce a value that never reaches
+            # the motors, and the screen would stop matching the hardware.
+            if demo is not None:
+                # Real sensor data is discarded for the duration, so live and
+                # scripted input can never mix. DEMO MODE is badged on screen
+                # the whole time.
+                _drain_queue(sensor.out_queue)
+                if now >= demo_next:
+                    demo_next = now + 1.0 / DEMO_FEED_HZ
+                    syn = demo.sample()
+                    if syn is None:
+                        demo = None
+                    else:
+                        bx, by, bz = syn
+                        last_bxyz = syn
+                        last_sample = pipeline.process(bx, by, bz)
+                        if logger.enabled:
+                            logger.log(log_row(time.time(), bx, by, bz,
+                                               last_sample, last_motors))
+            else:
+                while not sensor.out_queue.empty():
+                    ts, bx, by, bz = sensor.out_queue.get()
+                    last_bxyz = (bx, by, bz)
+                    if calibrating:
+                        if calibrator.feed(bx, by, bz):
+                            calibrating = False
+                            print(f"Baseline set: ({cfg.baseline_bx:.2f}, "
+                                  f"{cfg.baseline_by:.2f}, {cfg.baseline_bz:.2f})")
+                        continue
+                    last_sample = pipeline.process(bx, by, bz)
+                    if max_capture is not None:
+                        max_capture.feed(last_sample.M)
+                    if logger.enabled:
+                        # Motor columns are the last command actually sent (at
+                        # most 1/HAPTIC_SEND_HZ old), never a phantom value.
+                        logger.log(log_row(time.time(), bx, by, bz,
+                                           last_sample, last_motors))
+
+            # ---- calibration step 2 completion ----
+            if max_capture is not None and max_capture.done:
+                ok, msg = max_capture.commit()
+                if ok:
+                    max_calibrated = True
+                print("\n" + ("MAX CALIBRATION: " + msg))
+                notice = (msg, time.monotonic())
+                max_capture = None
 
             # ---- drain all pending sensor samples ----
             # encoder.update() is deliberately NOT called here. It is stateful
@@ -323,23 +626,6 @@ def run_full_mode(args):
             # dashboard and the GUI snapshot alike -- calling update() here as
             # well would produce a value that never reaches the motors, and the
             # screen would stop matching the hardware.
-            while not sensor.out_queue.empty():
-                ts, bx, by, bz = sensor.out_queue.get()
-                last_bxyz = (bx, by, bz)
-                if calibrating:
-                    if calibrator.feed(bx, by, bz):
-                        calibrating = False
-                        print(f"Baseline set: ({cfg.baseline_bx:.2f}, "
-                              f"{cfg.baseline_by:.2f}, {cfg.baseline_bz:.2f})")
-                    continue
-                last_sample = pipeline.process(bx, by, bz)
-                if logger.enabled:
-                    # Motor columns are the last command actually sent (at most
-                    # 1/HAPTIC_SEND_HZ old), never a recomputed phantom value.
-                    logger.log(log_row(time.time(), bx, by, bz, last_sample, last_motors))
-
-            now = time.monotonic()
-
             # ---- push motor command to haptic ESP32 at fixed rate ----
             if now - last_haptic_send >= 1.0 / HAPTIC_SEND_HZ:
                 last_haptic_send = now
@@ -351,10 +637,21 @@ def run_full_mode(args):
                     # stale sample (which stretched a 40ms pulse indefinitely).
                     last_sample.contact_onset = False
                     last_sample.contact_release = False
+                    if last_sample.contact_onset:
+                        onset_at = now
+                    if last_sample.contact_release:
+                        release_at = now
                     haptic.send_motor_command(MotorCommand.from_list(last_motors))
                 else:
                     last_motors, last_on_off = [0] * NUM_MOTORS, (0, 0)
                     haptic.stop()
+
+            # ---- liveness probe, so the GUI's latency readout is measured
+            # rather than guessed. PING does not reset the firmware watchdog;
+            # the 50 Hz M, stream above is what keeps it fed.
+            if now - last_ping >= HAPTIC_PING_S:
+                last_ping = now
+                haptic.ping()
 
             # ---- dashboard ----
             if now - last_dashboard >= 1.0 / DASHBOARD_HZ:
@@ -362,10 +659,40 @@ def run_full_mode(args):
                 bx, by, bz = last_bxyz
                 mode_label = "CALIBRATING..." if calibrating else "RUNNING"
                 if last_sample is None:
-                    last_sample = TactileSample(0, 0, 0, 0, 0, 0, 0, 0,
-                                                 TactileState.NO_CONTACT, 0.0, False, False)
+                    last_sample = idle_sample()
+                if demo is not None:
+                    mode_label = "DEMO MODE"
                 render_dashboard(sensor.rate_hz, bx, by, bz, last_sample, last_motors,
-                                  last_on_off, sensor.connected, haptic.is_connected(), mode_label)
+                                  last_on_off, sensor.connected, haptic.is_connected(),
+                                  mode_label, gui_url=gui_url)
+
+            # ---- GUI snapshot (decimated inside publish(), never blocks) ----
+            if hub is not None:
+                seq += 1
+                hub.publish(telemetry.build_snapshot(
+                    seq=seq, cfg=cfg,
+                    sample=last_sample if last_sample is not None else idle_sample(),
+                    motors=last_motors, on_off=last_on_off,
+                    bx=last_bxyz[0], by=last_bxyz[1], bz=last_bxyz[2],
+                    mode=("DEMO" if demo is not None else "LIVE"),
+                    calibrating=calibrating,
+                    sensor_ok=sensor.connected, sensor_rate_hz=sensor.rate_hz,
+                    haptic_ok=haptic.is_connected(),
+                    haptic_latency_ms=haptic.get_latency_ms(),
+                    transport_name=args.transport,
+                    baseline_progress=(
+                        min(1.0, len(calibrator._buf[0]) / float(BASELINE_SAMPLES))
+                        if calibrating else 1.0),
+                    max_calibrated=max_calibrated,
+                    max_capture=(max_capture.status() if max_capture else None),
+                    log_active=logger.enabled, log_path=logger.path,
+                    log_rows=logger.rows,
+                    demo=(demo.status() if demo is not None else {"active": False}),
+                    stream_hz=hub.stream_hz,
+                    events={"onset": (now - onset_at) < EVENT_STICKY_S,
+                            "release": (now - release_at) < EVENT_STICKY_S},
+                    notice=(notice[0] if notice and (now - notice[1]) < 5.0 else None),
+                ))
 
             time.sleep(MAIN_LOOP_SLEEP_S)
     except KeyboardInterrupt:
@@ -378,11 +705,17 @@ def run_full_mode(args):
         haptic.disconnect()
         keys.stop()
         logger.close()
+        if hub is not None:
+            hub.stop()
 
 
 def run_sensor_only_mode(args):
     sensor = SensorReader(args.sensor_port)
+    max_calibrated = os.path.exists(args.calibration_file)
     cfg = load_or_default_config(args.calibration_file)
+    logger = DemoLogger(enabled=False)   # GUI-startable; off unless asked
+    hub = start_hub(args)
+    gui_url = hub.url if hub is not None else None
 
     if args.calibrate:
         print("Running guided calibration wizard...")
@@ -398,33 +731,102 @@ def run_sensor_only_mode(args):
 
     last_dashboard = 0.0
     last_sample = None
+    last_bxyz = (0.0, 0.0, 0.0)
+    max_capture = None
+    notice = None
+    seq = 0
     running = True
     print("Sensor-only mode: motors will NOT be commanded. Ctrl+C to quit.")
     try:
         while running:
-            bx = by = bz = 0.0
+            # ---- GUI commands (no motor and no demo commands exist here:
+            # this mode never opens a haptic transport at all) ----
+            if hub is not None:
+                for cmd, _cargs in hub.drain_commands():
+                    if cmd == "calibrate_baseline":
+                        calibrator.begin()
+                        calibrating = True
+                        max_capture = None
+                    elif cmd == "calibrate_max":
+                        if calibrating:
+                            notice = ("finish baseline calibration first",
+                                      time.monotonic())
+                        else:
+                            max_capture = MaxCapture(cfg, args.calibration_file)
+                    elif cmd == "start_log":
+                        notice = (f"logging to {logger.start()}", time.monotonic())
+                    elif cmd == "stop_log":
+                        closed = logger.stop()
+                        notice = ((f"log closed: {closed}" if closed else "not logging"),
+                                  time.monotonic())
+                    elif cmd in ("stop_motors", "start_demo", "stop_demo"):
+                        notice = ("sensor-only mode: motors are never commanded",
+                                  time.monotonic())
+
             while not sensor.out_queue.empty():
                 ts, bx, by, bz = sensor.out_queue.get()
+                last_bxyz = (bx, by, bz)
                 if calibrating:
                     if calibrator.feed(bx, by, bz):
                         calibrating = False
                     continue
                 last_sample = pipeline.process(bx, by, bz)
+                if max_capture is not None:
+                    max_capture.feed(last_sample.M)
+                if logger.enabled:
+                    logger.log(log_row(time.time(), bx, by, bz, last_sample,
+                                       [0] * NUM_MOTORS))
 
             now = time.monotonic()
+
+            if max_capture is not None and max_capture.done:
+                ok, msg = max_capture.commit()
+                if ok:
+                    max_calibrated = True
+                notice = (msg, time.monotonic())
+                max_capture = None
+
             if now - last_dashboard >= 1.0 / DASHBOARD_HZ:
                 last_dashboard = now
                 mode_label = "CALIBRATING..." if calibrating else "SENSOR-ONLY"
                 if last_sample is None:
-                    last_sample = TactileSample(0, 0, 0, 0, 0, 0, 0, 0,
-                                                 TactileState.NO_CONTACT, 0.0, False, False)
+                    last_sample = idle_sample()
+                bx, by, bz = last_bxyz
                 render_dashboard(sensor.rate_hz, bx, by, bz, last_sample,
-                                  [0] * NUM_MOTORS, (0, 0), sensor.connected, False, mode_label)
+                                  [0] * NUM_MOTORS, (0, 0), sensor.connected, False,
+                                  mode_label, gui_url=gui_url)
+
+            if hub is not None:
+                seq += 1
+                hub.publish(telemetry.build_snapshot(
+                    seq=seq, cfg=cfg,
+                    sample=last_sample if last_sample is not None else idle_sample(),
+                    motors=[0] * NUM_MOTORS, on_off=(0, 0),
+                    bx=last_bxyz[0], by=last_bxyz[1], bz=last_bxyz[2],
+                    mode="SENSOR-ONLY", calibrating=calibrating,
+                    sensor_ok=sensor.connected, sensor_rate_hz=sensor.rate_hz,
+                    haptic_ok=False, haptic_latency_ms=None,
+                    transport_name="none",
+                    baseline_progress=(
+                        min(1.0, len(calibrator._buf[0]) / float(BASELINE_SAMPLES))
+                        if calibrating else 1.0),
+                    max_calibrated=max_calibrated,
+                    max_capture=(max_capture.status() if max_capture else None),
+                    log_active=logger.enabled, log_path=logger.path,
+                    log_rows=logger.rows,
+                    demo={"active": False},
+                    stream_hz=hub.stream_hz,
+                    notice=(notice[0] if notice and (now - notice[1]) < 5.0 else None),
+                ))
+
             time.sleep(MAIN_LOOP_SLEEP_S)
     except KeyboardInterrupt:
         pass
     finally:
         sensor.stop()
+        logger.close()
+        if hub is not None:
+            hub.stop()
 
 
 def run_simulate_mode(args):
@@ -493,6 +895,17 @@ def main():
                          help="Path to calibration.json (default: calibration.json)")
     parser.add_argument("--calibrate", action="store_true",
                          help="Run the guided calibration wizard before starting (requires --sensor-port)")
+    parser.add_argument("--gui", action="store_true",
+                         help="Serve the browser dashboard (full and sensor-only modes). "
+                              "The terminal dashboard keeps running regardless - it is the "
+                              "fallback if the browser dies mid-demo.")
+    parser.add_argument("--gui-port", type=int, default=telemetry.DEFAULT_PORT,
+                         help=f"Port for the GUI server (default {telemetry.DEFAULT_PORT})")
+    parser.add_argument("--gui-host", default=telemetry.DEFAULT_HOST,
+                         help=f"Bind address for the GUI server (default "
+                              f"{telemetry.DEFAULT_HOST}). Only change this if you "
+                              f"deliberately want the dashboard - which can start and "
+                              f"stop motors - reachable from other machines.")
     parser.add_argument("--transport", default=get_default_transport_name(),
                          choices=["usb", "wifi", "ble", "bluetooth", "espnow"],
                          help="Haptic ESP32 transport (default: usb, or $TRANSPORT env var). "
