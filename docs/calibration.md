@@ -69,6 +69,30 @@ intensity levels feel the same, widen the gap between their `on_ms`/
 `off_ms` pair, or move a recruitment threshold so an extra motor kicks in
 sooner.
 
+## In the GUI (two buttons, same `calibration.json`)
+
+`--gui` exposes steps 1 and 5 above as the two calibration steps that
+have to be measured per patch:
+
+1. **CALIBRATE BASELINE** -- the same 100-sample median as the automatic
+   startup baseline, re-runnable without restarting. Keep the patch
+   untouched; a banner says so and shows progress.
+2. **CALIBRATE MAXIMUM** -- hold the hardest press the demo will use for
+   4 s. Peak `M` becomes `max_level`. Refuses to save a peak at or below
+   `contact_level`, since that would invert the intensity scale.
+
+Both write to the same `calibration.json` this document describes; there
+is no second config file. `deadband`, `contact_level`, `gamma`,
+`pulse_table` and `recruitment_table` are **not** settable from the GUI --
+use the guided wizard below and the by-feel steps above.
+
+Until step 2 has been run, the dashboard displays **"MAXIMUM NOT
+CALIBRATED - I is undefined"** and names the placeholder `max_level` it is
+dividing by. That is deliberate: without it, `I` is a percentage of an
+arbitrary number, and every mapping downstream (PWM curve, pulse timing,
+recruitment) is reading against a scale that does not belong to your
+patch.
+
 ## Guided calibration wizard
 
 `pc/haptic_algorithm.py` includes `run_guided_calibration()`, invoked via:

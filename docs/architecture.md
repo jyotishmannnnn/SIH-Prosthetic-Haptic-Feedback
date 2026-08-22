@@ -136,6 +136,49 @@ See `docs/serial-protocol.md` for exact wire formats.
 - PC: on any keyboard interrupt / shutdown, sends `S` to the Haptic ESP32
   before exiting.
 
+## Known timing limitation (PC side, measured)
+
+`MAIN_LOOP_SLEEP_S = 0.002` in `pc/haptic_engine.py` is commented as a
+"~500Hz poll". On Windows with Python 3.10 that is not what happens:
+`time.sleep()` and `time.monotonic()` both have ~15.6 ms granularity
+there, so the main loop actually runs at **~65 Hz**, measured on the
+development machine:
+
+```
+sleep(0.002) -> 65.2 iterations/s   actual per-sleep 15.33 ms
+time.monotonic     resolution = 15.625 ms
+time.perf_counter  resolution =  0.0001 ms
+```
+
+Consequences, in order of how much they matter:
+
+1. **Pulse timing is quantized to ~15.6 ms.** The fastest row of
+   `pulse_table` is 120 ms ON / 40 ms OFF, so at high intensity the OFF
+   phase lands on 15.6 ms boundaries -- a meaningful error on the
+   shortest phases, and a plausible cause of adjacent intensity levels
+   feeling less distinct than the table implies. Worth knowing before
+   spending bench time retuning `gamma` or the tables to fix something
+   that is actually a clock problem.
+2. **`HAPTIC_SEND_HZ = 50` is not achieved.** The send tick can only be
+   checked every ~15.6 ms, so commands go out at ~32 Hz with jitter.
+   Still far inside the 500 ms firmware watchdog, so this is a fidelity
+   issue and not a safety one.
+3. The GUI stream tops out around 21 Hz instead of 30 for the same
+   reason -- the engine cannot call `publish()` any more often than its
+   own loop runs. Harmless for a dashboard.
+
+Two fixes, neither applied here:
+
+- **Run Python 3.11 or newer.** 3.11 switched `time.sleep()` to a
+  high-resolution waitable timer on Windows. No code change at all.
+- Raise the system timer resolution for the process:
+  `ctypes.windll.winmm.timeBeginPeriod(1)` at startup, paired with
+  `timeEndPeriod(1)` on exit. Five lines, Windows-only, needs guarding.
+
+`pc/telemetry.py` already uses `perf_counter` rather than `monotonic`
+internally for exactly this reason; the engine's own timing still uses
+`monotonic`.
+
 ## What this repository does NOT implement yet
 
 - Multiple MLX90393 sensors / multi-patch eFlesh (current prototype uses

@@ -83,7 +83,8 @@ Full pin tables and I2C/driver wiring: `docs/hardware.md`.
 | Haptic firmware | `firmware/haptic-controller/haptic_controller_v1/` | Receives `M,...`/`S` commands, drives 6 PWM motor outputs, 500ms comm watchdog. Nothing else. |
 | PC processing | `pc/haptic_algorithm.py` | The actual tactile-processing/haptic-encoding algorithm + calibration logic. |
 | PC runner | `pc/haptic_engine.py` | Serial I/O, terminal dashboard, CLI modes, CSV logging. Drives `haptic_algorithm.py`. |
-| GUI | `gui/` | **WIP** for this pipeline — see `gui/README.md`. A separate, unrelated legacy GUI (different project) lives in `gui/legacy-alpaca-fsr-glove/`. |
+| GUI | `gui/` | Browser dashboard, single self-contained HTML file, served by the engine with `--gui`. Read-only view + control surface; computes no tactile or haptic values of its own. See `gui/README.md`. A separate, unrelated legacy GUI (different project) lives in `gui/legacy-alpaca-fsr-glove/`. |
+| GUI plumbing | `pc/telemetry.py` | Snapshot formatter + stdlib SSE server. No third-party dependency. |
 | Legacy firmware | `firmware/legacy/eFlesh_haptic_v1_single_board/` | Superseded single-board (no PC) version of this pipeline. |
 
 ## Signal Processing

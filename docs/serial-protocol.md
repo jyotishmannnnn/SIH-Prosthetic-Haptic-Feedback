@@ -126,6 +126,45 @@ against PC crash, Python crash, USB disconnect, or a frozen processing
 loop. `S` also counts as a valid command for watchdog purposes (an
 explicit stop is not "silence").
 
+## PC -> GUI telemetry (not a hardware link)
+
+The browser dashboard (`gui/`, served by `pc/telemetry.py`) is a third
+stream, and unlike the two above it touches no hardware at all. It is
+listed here so all three wire formats live in one document.
+
+Transport is Server-Sent Events over a stdlib HTTP server on
+`127.0.0.1:8770` by default. No third-party package, and the dashboard is
+served from the same origin as its data.
+
+```
+GET  /        -> gui/index.html
+GET  /raw     -> gui/raw.html          (unstyled JSON dump)
+GET  /stream  -> text/event-stream     (one JSON snapshot per event)
+POST /cmd     -> {"cmd": "<name>"}     -> 202, or 400 if not whitelisted
+```
+
+One `data: {...}` event per frame, decimated from the ~100 Hz sensor rate
+to ~30 Hz. Each snapshot carries the raw field, the filtered deltas, the
+M/N/S/dM/HF features, the intensity and band, **the exact six motor PWM
+values that were sent to the haptic ESP32 on that frame**, the pulse
+pattern, both link states, and the live calibration parameters. Full field
+list: `telemetry.build_snapshot()`.
+
+Inbound commands are whitelisted (`telemetry.ALLOWED_COMMANDS`):
+`calibrate_baseline`, `calibrate_max`, `start_demo`, `stop_demo`,
+`start_log`, `stop_log`, `stop_motors`. The browser sends a command *name*
+only. `pc/haptic_engine.py` remains the only thing that opens a serial
+port, and the GUI has no way to emit an arbitrary `M,`/`P,`/`A,` command.
+
+### Error handling (GUI side)
+- `publish()` never blocks the engine's main loop: bounded per-client
+  queues, oldest frame dropped when a browser stops reading.
+- A dead browser is invisible to the engine. A dead engine turns the
+  dashboard red rather than leaving stale numbers looking live, and
+  `EventSource` reconnects on its own when the engine returns.
+- Non-whitelisted or malformed commands are rejected with a 400 and never
+  reach the engine's command queue.
+
 ## Practical note: send rate
 
 `pc/haptic_engine.py` pushes `M,` commands to the Haptic ESP32 at a fixed

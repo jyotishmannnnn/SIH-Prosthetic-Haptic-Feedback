@@ -39,8 +39,14 @@ passes. Full detail: `docs/hardware.md` (wiring), `docs/serial-protocol.md`
 - Both ESP32-S3 boards flashed and wired per `docs/hardware.md`.
 - `calibration.json` present and tuned for the demo unit's eFlesh patch
   (`docs/calibration.md`) — do this well before the demo, not live.
-- `python haptic_engine.py --sensor-port COMx --haptic-port COMy` running,
-  dashboard visible on a screen the audience can see.
+- `python haptic_engine.py --sensor-port COMx --haptic-port COMy --gui`
+  running, with <http://127.0.0.1:8770/> open full-screen on a screen the
+  audience can see. The terminal dashboard keeps running behind it and is
+  the fallback if the browser misbehaves.
+- The dashboard must NOT be showing "MAXIMUM NOT CALIBRATED". If it is,
+  `max_level` is still the built-in placeholder and every percentage on
+  screen is measured against a number that means nothing for this patch --
+  run calibration step 2 before demonstrating.
 - eFlesh untouched during the startup baseline calibration message.
 
 ## Script
@@ -75,11 +81,19 @@ say explicitly: intensity is relative, calibrated to this patch — not a
 Newton reading.
 
 **6. Show dashboard response.**
-Call out the live terminal dashboard fields: sensor rate, Bx/By/Bz,
-filtered magnitude, intensity bar, motor states, pulse pattern,
-connection status for both ESP32 links. (There is currently no dedicated
-graphical GUI for this pipeline — the terminal dashboard is the
-real-time visualization; see `gui/README.md`.)
+Call out the live fields on the browser dashboard: the intensity bar and
+band label, the six-motor array (which mirrors the exact command sent to
+the haptic ESP32), the scrolling magnitude trace crossing the contact
+threshold, the highlighted signal path, and the connection status for
+both ESP32 links. The collapsed debug panel has the raw field, baseline,
+deltas and features if a judge asks for them.
+
+Worth pointing at explicitly: the intensity bar's tick marks are the
+motor-recruitment thresholds, so the band label changes on the same frame
+a motor joins in -- the label and the hardware cannot disagree.
+
+The terminal dashboard shows the same values at 8 Hz and remains the
+fallback if the browser dies. See `gui/README.md`.
 
 **7. Show motor recruitment.**
 Explicitly point out that motor count increases with intensity (not just
@@ -99,6 +113,9 @@ model, rather than relying on relative thresholds. This is planned, not
 built.
 
 **10. Explain EEG as future intent-input integration.**
+The dashboard's greyed "NEURAL INTENT INTERFACE - NEXT INTEGRATION" block
+is the honest on-screen version of this: visibly present, visibly not
+working. Point at it rather than talking around it.
 State clearly: EEG/sEMG-based intent control is a separate, future
 integration, not part of this demo. This demo is the **afferent
 (feedback) half** of the loop — sensing what the hand touches and
@@ -112,3 +129,7 @@ relaying it to the user. The efferent (control) half is future work.
 - Don't claim multi-sensor eFlesh, EEG, or Sentrix integration exist yet.
 - Don't cite the original eFlesh paper's accuracy numbers as this
   prototype's results.
+- Don't present DEMO MODE as live sensing. It is badged on screen for a
+  reason: the sensor input is scripted (though it runs through the real
+  pipeline and really does drive the motors). Press the patch yourself for
+  the live claim.
