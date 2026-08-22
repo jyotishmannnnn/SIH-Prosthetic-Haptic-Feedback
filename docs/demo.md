@@ -3,6 +3,37 @@
 Target duration: 3-5 minutes. Keep the story technically honest — every
 claim below matches what the current prototype actually does.
 
+## Hardware bring-up & validation (do this before the demo, not on demo day)
+
+Run in this order — each step only makes sense once the previous one
+passes. Full detail: `docs/hardware.md` (wiring), `docs/serial-protocol.md`
+(commands).
+
+1. **One motor (already done).** GPIO9 -> 333 ohm -> CPN2222A -> Motor 0,
+   physically bench-verified working.
+2. **Six motors, digital only.** Flash `haptic_controller_v1.ino` with
+   `MOTOR_TEST_MODE 1`. Confirm over serial monitor: each motor spins in
+   turn for 1s (M0 through M5), then all six spin together for 1s, then
+   all stop, then the sequence repeats. Typing `S` at any point stops
+   everything immediately. This proves GPIO -> transistor -> motor wiring
+   for all six channels before any PWM/software complexity is added.
+3. **Six motors, PWM, manual.** Set `MOTOR_TEST_MODE 0`, reflash. Open a
+   serial monitor at 115200 baud, confirm the `Haptic Controller V1` /
+   pin table / `READY` banner. Manually test `P,0,150`, `P,5,255`,
+   `A,150`, `S` and confirm each motor responds and `S` stops everything.
+4. **PC integration, no eFlesh needed.** Run
+   `python pc/haptic_engine.py --simulate --haptic-port COMx` and confirm
+   the six-motor response escalates through intensity levels exactly as
+   described in "Show motor recruitment" below, driven entirely by
+   `pc/haptic_algorithm.py` — the ESP32 is only executing `M,` commands
+   at this point, not deciding anything.
+5. **Sensor interference check.** Before relying on simultaneous
+   sensor+motor operation, run the procedure in `docs/hardware.md`
+   ("Sensor interference test") and confirm motor activation doesn't
+   corrupt the MLX90393 reading enough to trigger false contact.
+6. **Full loop.** Both ESP32 boards + PC, real eFlesh. Proceed to the
+   demo script below.
+
 ## Before the demo
 
 - Both ESP32-S3 boards flashed and wired per `docs/hardware.md`.

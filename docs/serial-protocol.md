@@ -77,6 +77,27 @@ STATUS,<m0>,<m1>,<m2>,<m3>,<m4>,<m5>,age_ms=<n>
 where `age_ms` is milliseconds since the last valid command was received
 (useful for confirming the watchdog is/isn't about to trip).
 
+### Bench-test-only commands (not used by the PC algorithm)
+
+For manually exercising individual motors from a serial terminal during
+hardware bring-up, without running `haptic_engine.py`:
+
+```
+P,<index>,<pwm>\n
+```
+Sets one motor directly. Example: `P,0,150` -> Motor 0 = PWM 150. Replies
+`OK M0=150`.
+
+```
+A,<pwm>\n
+```
+Sets all motors to the same PWM. Example: `A,255` -> all six motors = 255.
+Replies `OK ALL=255`.
+
+These count as a valid command for watchdog purposes, same as `M,`/`S`.
+`pc/haptic_algorithm.py` never sends `P,`/`A,` — they exist purely for
+bench debugging over a serial monitor before connecting the PC.
+
 ### Error handling (haptic side)
 - Values outside 0-255 are clamped in firmware.
 - A malformed `M,` line (wrong field count, non-numeric value) is dropped

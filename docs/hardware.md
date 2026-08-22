@@ -49,56 +49,103 @@ repo, install it into your Arduino `libraries/` folder manually).
 
 ## Haptic ESP32-S3
 
-| Motor | XIAO Pin | GPIO |
-|---|---|---|
-| M0 | D0 | 1 |
-| M1 | D1 | 2 |
-| M2 | D2 | 3 |
-| M3 | D3 | 4 |
-| M4 | D8 | 7 |
-| M5 | D9 | 8 |
+| Motor | XIAO Pin | GPIO | Status |
+|---|---|---|---|
+| M0 | D10 | 9 | **Physically bench-verified** — GPIO9 -> 333 ohm -> CPN2222A base, confirmed spinning a real coin motor before this firmware was written. Do not move this pin without re-verifying. |
+| M1 | D9 | 8 | Same topology as M0, not yet individually bench-verified at time of writing |
+| M2 | D8 | 7 | Same topology as M0, not yet individually bench-verified at time of writing |
+| M3 | D3 | 4 | Same topology as M0, not yet individually bench-verified at time of writing |
+| M4 | D2 | 3 | Same topology as M0, not yet individually bench-verified at time of writing |
+| M5 | D1 | 2 | Same topology as M0, not yet individually bench-verified at time of writing |
 
-D4/D5 avoided (this board family's default I2C pins, unused on this
-board but kept clear), D6/D7 avoided (UART0).
+D0 (GPIO1) left spare. D4/D5 avoided (this board family's default I2C
+pins — not needed on this board since it never reads the MLX90393, kept
+clear anyway for consistency with the sensor board's pin docs). D6/D7
+(GPIO43/44, UART0) avoided — GPIO43 blips for ~200ms at boot with the ROM
+bootloader log, which would visibly glitch a motor at power-up.
+
+This mapping supersedes an earlier placeholder mapping (M0 on D0/GPIO1)
+used before Motor 0 was bench-verified on GPIO9 — GPIO9 is now fixed as
+M0 because it's the one pin physically proven to work end-to-end.
 
 PWM: ESP32 Arduino core 3.x pin-addressed LEDC API
 (`ledcAttach(pin, freq, resolutionBits)` + `ledcWrite(pin, duty)`),
-20 kHz carrier (above audible range), 8-bit duty resolution (0-255).
+configurable via `PWM_FREQUENCY` (default 20 kHz, above audible range)
+and `PWM_RESOLUTION` (default 8-bit, 0-255 duty) in the firmware.
 
-## Motor driver stage — ASSUMPTION, not verified against a schematic
+## Motor driver stage — PHYSICALLY VERIFIED (CPN2222A), same circuit on all six channels
 
 **Coin ERM motors must not be driven directly from ESP32 GPIO** — they
 draw more current than a GPIO pin can safely source and are inductive
-(brushed DC), producing back-EMF on turn-off. No motor driver schematic
-exists in this repo or in the upstream eFlesh source, so the following is
-an assumed, generic driver stage per motor:
+(brushed DC), producing back-EMF on turn-off.
+
+This is no longer an assumption: the following circuit was bench-tested
+on Motor 0 with a real coin motor before being scaled to all six
+channels, and is the actual topology `haptic_controller_v1.ino` is
+written against:
 
 ```
-XIAO GPIO (PWM, 0-3.3V)
-   -> 220 ohm - 1k ohm gate/base resistor
-   -> N-channel MOSFET gate (e.g. AO3400) or NPN base (e.g. 2N2222)
-      MOSFET drain / transistor collector -> motor (-) terminal
-      motor (+) terminal -> separate motor supply rail (NOT the ESP32 3V3 rail)
-      MOSFET source / transistor emitter -> common GND (shared with ESP32 GND)
-      flyback diode (1N4148/1N5819) across motor terminals, cathode to +supply
+XIAO GPIO (digital / PWM, 0-3.3V)
+   -> 333 ohm resistor
+   -> CPN2222A (2N2222-family NPN) base
+      CPN2222A collector -> motor (-) terminal
+      motor (+) terminal -> motor supply rail
+      CPN2222A emitter -> common GND (shared with ESP32 GND)
 ```
 
-If a specific driver board/circuit is later chosen, update this file and
-`firmware/haptic-controller/haptic_controller_v1/haptic_controller_v1.ino`'s
-`MOTOR_PWM_INVERTED` define together (that's the only place polarity
-inversion is applied).
+- Logic: **GPIO HIGH / PWM duty > 0 = motor ON** (NPN, low-side). No
+  inversion needed — `MOTOR_PWM_INVERTED` in firmware is `false`.
+- All six motor channels use this exact same topology (one CPN2222A +
+  one 333 ohm resistor per motor) — nothing motor-specific changes
+  between channels other than the GPIO pin.
+- **Flyback protection has not been added or measured yet.** The
+  single-motor proof-of-concept ran without one. Before extended/high-
+  duty-cycle operation, measure the transistor's collector voltage on
+  turn-off with a scope/multimeter; add a flyback diode (cathode to
+  motor +, anode to motor -) per channel if the turn-off spike is a
+  concern for your specific transistor's voltage rating. Not added
+  pre-emptively per "don't unnecessarily change the already-working
+  setup" — document here if a channel is later found to need one.
+- Motor supply rail voltage/current budget across all six channels
+  simultaneously has not been measured yet — see `docs/demo.md` for the
+  bring-up test order (one motor -> all six digital -> PWM) that will
+  surface any supply-side issues before the PC algorithm is connected.
 
-### Related, unresolved reference: ALPACA driver design
+### Related reference: ALPACA driver design (different project, PNP variant)
 
 A separate/earlier prototype (`gui/legacy-alpaca-fsr-glove/`) documents a
-**working, tested** driver circuit for coin ERM motors on a XIAO
-ESP32-S3: a single BC557 PNP transistor per motor, high-side, GPIO LOW =
-motor ON (see `gui/legacy-alpaca-fsr-glove/ALPACA_haptic_handoff.md`,
-"Motor driver" section). It targets a 3.3V motor rail specifically and
-notes it would need a second transistor stage on a 5V rail. This is a
-different hardware/pin context (single-board FSR glove, not the
-two-ESP32 eFlesh split) but is a real, bench-verified circuit worth
-reusing or adapting if you don't already have a driver board.
+similar but distinct driver: BC557 **PNP**, high-side, GPIO LOW = motor
+ON (see `gui/legacy-alpaca-fsr-glove/ALPACA_haptic_handoff.md`, "Motor
+driver" section). Not used here — this repo's haptic controller uses the
+NPN/low-side CPN2222A topology above — kept as a cross-reference only.
+
+## Sensor interference test — REQUIRED, NOT YET PERFORMED
+
+Coin ERM motors contain a magnet; the MLX90393 is a magnetometer. Motor
+activation could inject a magnetic signal the tactile pipeline
+misreads as contact. **This has not been measured yet** — do not assume
+it's fine, and do not compensate for it in software before measuring.
+
+Procedure (run once both boards are wired and firmware flashed):
+1. eFlesh untouched, all motors OFF. Record `M` (filtered magnitude) from
+   `python haptic_engine.py --sensor-only --sensor-port COMx` for ~10s.
+2. Turn Motor 0 ON (steady PWM, e.g. `P,0,200` over the Haptic ESP32's
+   serial monitor, or `MOTOR_TEST_MODE=1`). Record `M` again for ~10s,
+   eFlesh still untouched.
+3. Turn all six motors ON simultaneously (`A,200`). Record `M` again for
+   ~10s, eFlesh still untouched.
+4. Compare the three recordings. If motors-ON `M` is comparable to or
+   exceeds `CONTACT_LEVEL` from your calibration, the motors are
+   corrupting the tactile signal.
+
+If interference is found: the fix is physical (increase spacing between
+motors and the MLX90393, reorient motors so their magnetic axis doesn't
+couple into the sensor's axes, or shield the sensor) — not a software
+deadband/threshold hack, since that would silently reduce real
+sensitivity along with the interference.
+
+**Status: not yet run.** Fill in actual measured `M` values here once
+tested, before relying on simultaneous sensor+motor operation for a demo.
 
 ## Onboard status LED
 
