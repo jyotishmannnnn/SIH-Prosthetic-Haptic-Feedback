@@ -47,7 +47,8 @@ except ImportError:
 from haptic_algorithm import (
     HapticConfig, TactilePipeline, HapticEncoder, Calibrator,
     run_guided_calibration, log_row, LOG_COLUMNS,
-    NUM_MOTORS, simulate as simulate_magnitudes,
+    NUM_MOTORS, TactileSample, TactileState,
+    simulate as simulate_magnitudes,
 )
 from transports import get_transport, MotorCommand, get_default_transport_name
 
@@ -296,6 +297,7 @@ def run_full_mode(args):
     last_dashboard = 0.0
     last_sample = None
     last_on_off = (0, 0)
+    last_motors = [0] * NUM_MOTORS   # the last command ACTUALLY SENT to the haptic ESP32
     running = True
 
     try:
@@ -314,6 +316,13 @@ def run_full_mode(args):
                     running = False
 
             # ---- drain all pending sensor samples ----
+            # encoder.update() is deliberately NOT called here. It is stateful
+            # (wall-clock pulse phase + one-shot transient window), so it is
+            # called exactly ONCE per send tick below. That single result is
+            # authoritative for the motor command, the CSV row, the terminal
+            # dashboard and the GUI snapshot alike -- calling update() here as
+            # well would produce a value that never reaches the motors, and the
+            # screen would stop matching the hardware.
             while not sensor.out_queue.empty():
                 ts, bx, by, bz = sensor.out_queue.get()
                 last_bxyz = (bx, by, bz)
@@ -324,9 +333,10 @@ def run_full_mode(args):
                               f"{cfg.baseline_by:.2f}, {cfg.baseline_bz:.2f})")
                     continue
                 last_sample = pipeline.process(bx, by, bz)
-                motors, last_on_off = encoder.update(last_sample)
                 if logger.enabled:
-                    logger.log(log_row(time.time(), bx, by, bz, last_sample, motors))
+                    # Motor columns are the last command actually sent (at most
+                    # 1/HAPTIC_SEND_HZ old), never a recomputed phantom value.
+                    logger.log(log_row(time.time(), bx, by, bz, last_sample, last_motors))
 
             now = time.monotonic()
 
@@ -334,9 +344,16 @@ def run_full_mode(args):
             if now - last_haptic_send >= 1.0 / HAPTIC_SEND_HZ:
                 last_haptic_send = now
                 if not calibrating and last_sample is not None:
-                    motors, last_on_off = encoder.update(last_sample)
-                    haptic.send_motor_command(MotorCommand.from_list(motors))
+                    last_motors, last_on_off = encoder.update(last_sample)
+                    # The one-shot event flags have now been consumed by that
+                    # single update() call. Clearing them stops the next tick
+                    # from re-arming the onset/release transient off the same
+                    # stale sample (which stretched a 40ms pulse indefinitely).
+                    last_sample.contact_onset = False
+                    last_sample.contact_release = False
+                    haptic.send_motor_command(MotorCommand.from_list(last_motors))
                 else:
+                    last_motors, last_on_off = [0] * NUM_MOTORS, (0, 0)
                     haptic.stop()
 
             # ---- dashboard ----
@@ -344,14 +361,10 @@ def run_full_mode(args):
                 last_dashboard = now
                 bx, by, bz = last_bxyz
                 mode_label = "CALIBRATING..." if calibrating else "RUNNING"
-                if last_sample is not None:
-                    motors, _ = encoder.update(last_sample)
-                else:
-                    motors = [0] * NUM_MOTORS
-                    from haptic_algorithm import TactileSample, TactileState
+                if last_sample is None:
                     last_sample = TactileSample(0, 0, 0, 0, 0, 0, 0, 0,
                                                  TactileState.NO_CONTACT, 0.0, False, False)
-                render_dashboard(sensor.rate_hz, bx, by, bz, last_sample, motors,
+                render_dashboard(sensor.rate_hz, bx, by, bz, last_sample, last_motors,
                                   last_on_off, sensor.connected, haptic.is_connected(), mode_label)
 
             time.sleep(MAIN_LOOP_SLEEP_S)
@@ -403,7 +416,6 @@ def run_sensor_only_mode(args):
                 last_dashboard = now
                 mode_label = "CALIBRATING..." if calibrating else "SENSOR-ONLY"
                 if last_sample is None:
-                    from haptic_algorithm import TactileSample, TactileState
                     last_sample = TactileSample(0, 0, 0, 0, 0, 0, 0, 0,
                                                  TactileState.NO_CONTACT, 0.0, False, False)
                 render_dashboard(sensor.rate_hz, bx, by, bz, last_sample,
@@ -435,16 +447,17 @@ def run_simulate_mode(args):
     # Re-run the same sweep, this time actually sending to the Haptic ESP32
     # (kept as a second pass so the on-screen preview above and the real
     # motor drive are not interleaved/confusing).
-    from haptic_algorithm import TactilePipeline, HapticEncoder, TactileSample, TactileState
     encoder = HapticEncoder(cfg)
     last_haptic_send = 0.0
     try:
         for mag in synthetic_sequence:
             step_start = time.monotonic()
             while time.monotonic() - step_start < 2.0:
-                on_th = cfg.contact_level
-                off_th = cfg.contact_level * cfg.release_hysteresis_ratio
-                contact = mag > off_th
+                # Latch on the ON threshold, matching TactilePipeline.process()
+                # and docs/haptic-algorithm.md. This previously compared against
+                # off_th (the release threshold), so simulate mode declared
+                # contact at 0.6x contact_level -- inconsistent with live mode.
+                contact = mag > cfg.contact_level
                 I = max(0.0, min(1.0, (mag - cfg.contact_level) /
                                   max(cfg.max_level - cfg.contact_level, 1e-6))) if contact else 0.0
                 sample = TactileSample(0, 0, mag, mag, mag, 0, 0, 0,
