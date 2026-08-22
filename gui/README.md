@@ -19,6 +19,18 @@ A browser/desktop GUI covering the same fields (per the original scope
 for this pipeline) has not been built yet — this is intentionally called
 out as not-done rather than implied to exist.
 
+## Transport selection (for a future GUI)
+
+`pc/transports/` (see `docs/transport-options.md`) already exposes a
+single factory, `transports.get_transport("usb"|"wifi"|"ble"|"espnow", ...)`,
+returning an object with `connect()`/`is_connected()`/`get_latency_ms()`/
+`send_motor_command()`. A future GUI's "HAPTIC CONNECTION" panel (radio
+buttons for USB/Wi-Fi/Bluetooth/ESP-NOW + a Connect button + a
+Transport/Status/Latency readout) should call this factory directly —
+it must not implement any transport protocol logic itself. Today,
+`pc/haptic_engine.py --transport <name>` is the interim selector until a
+GUI exists.
+
 ## Legacy GUI (different project)
 
 `legacy-alpaca-fsr-glove/` contains a **complete, working** embedded

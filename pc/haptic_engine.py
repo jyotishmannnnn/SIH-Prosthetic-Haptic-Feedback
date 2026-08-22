@@ -20,7 +20,14 @@ Usage:
     python haptic_engine.py --simulate --haptic-port COM8
     python haptic_engine.py --sensor-only --sensor-port COM7
 
-Required package: pyserial (pip install pyserial)
+    # Alternate haptic transports (see transports/, docs/transport-options.md).
+    # USB is the only one tested against real hardware.
+    python haptic_engine.py --sensor-port COM7 --transport wifi
+    python haptic_engine.py --sensor-port COM7 --transport ble
+
+Required package: pyserial (pip install pyserial). Wi-Fi transport needs
+no extra package (stdlib socket); BLE transport needs 'bleak' (pip
+install bleak), only if you actually select --transport ble.
 """
 
 import argparse
@@ -39,9 +46,10 @@ except ImportError:
 
 from haptic_algorithm import (
     HapticConfig, TactilePipeline, HapticEncoder, Calibrator,
-    run_guided_calibration, build_motor_command, log_row, LOG_COLUMNS,
+    run_guided_calibration, log_row, LOG_COLUMNS,
     NUM_MOTORS, simulate as simulate_magnitudes,
 )
+from transports import get_transport, MotorCommand, get_default_transport_name
 
 BAUD_RATE = 115200
 SERIAL_READ_TIMEOUT_S = 0.01
@@ -119,56 +127,6 @@ class SensorReader(threading.Thread):
             return (bx, by, bz)
         except queue.Empty:
             raise TimeoutError("No sensor data received — check wiring/port.")
-
-    def stop(self):
-        self.running = False
-        try:
-            self.ser.close()
-        except Exception:
-            pass
-
-
-class HapticLink:
-    """Sends 'M,...'/'S'/'PING'/'STATUS' commands to the Haptic ESP32 and
-    drains its replies in the background so the OS serial buffer never
-    backs up."""
-
-    def __init__(self, port, baud=BAUD_RATE):
-        self.ser = serial.Serial(port, baud, timeout=SERIAL_READ_TIMEOUT_S)
-        self.running = True
-        self.connected = True
-        self.last_reply = ""
-        self._reader = threading.Thread(target=self._drain, daemon=True)
-        self._reader.start()
-
-    def _drain(self):
-        while self.running:
-            try:
-                raw = self.ser.readline()
-            except serial.SerialException:
-                self.connected = False
-                time.sleep(0.1)
-                continue
-            if raw:
-                self.last_reply = raw.decode("ascii", errors="replace").strip()
-
-    def send_motors(self, intensities):
-        self._write(build_motor_command(intensities) + "\n")
-
-    def send_stop(self):
-        self._write("S\n")
-
-    def send_ping(self):
-        self._write("PING\n")
-
-    def send_status_request(self):
-        self._write("STATUS\n")
-
-    def _write(self, line):
-        try:
-            self.ser.write(line.encode("ascii"))
-        except serial.SerialException:
-            self.connected = False
 
     def stop(self):
         self.running = False
@@ -310,7 +268,10 @@ def render_dashboard(sensor_rate, bx, by, bz, sample, motors, on_off,
 
 def run_full_mode(args):
     sensor = SensorReader(args.sensor_port)
-    haptic = HapticLink(args.haptic_port)
+    haptic = get_transport(args.transport, port=args.haptic_port)
+    if not haptic.connect():
+        print(f"[WARN] Could not connect haptic transport '{args.transport}' — "
+              f"continuing, dashboard will show 'Haptic connection: LOST'.")
     logger = DemoLogger(enabled=not args.no_log)
     keys = KeyboardReader()
     keys.start()
@@ -344,11 +305,11 @@ def run_full_mode(args):
                 cmd = keys.out_queue.get()
                 if cmd == "b":
                     print("\nRecalibrating baseline. DO NOT TOUCH the eFlesh...")
-                    haptic.send_stop()
+                    haptic.stop()
                     calibrator.begin()
                     calibrating = True
                 elif cmd == "s":
-                    haptic.send_stop()
+                    haptic.stop()
                 elif cmd == "q":
                     running = False
 
@@ -374,9 +335,9 @@ def run_full_mode(args):
                 last_haptic_send = now
                 if not calibrating and last_sample is not None:
                     motors, last_on_off = encoder.update(last_sample)
-                    haptic.send_motors(motors)
+                    haptic.send_motor_command(MotorCommand.from_list(motors))
                 else:
-                    haptic.send_stop()
+                    haptic.stop()
 
             # ---- dashboard ----
             if now - last_dashboard >= 1.0 / DASHBOARD_HZ:
@@ -391,17 +352,17 @@ def run_full_mode(args):
                     last_sample = TactileSample(0, 0, 0, 0, 0, 0, 0, 0,
                                                  TactileState.NO_CONTACT, 0.0, False, False)
                 render_dashboard(sensor.rate_hz, bx, by, bz, last_sample, motors,
-                                  last_on_off, sensor.connected, haptic.connected, mode_label)
+                                  last_on_off, sensor.connected, haptic.is_connected(), mode_label)
 
             time.sleep(MAIN_LOOP_SLEEP_S)
     except KeyboardInterrupt:
         pass
     finally:
         print("\nShutting down: stopping all motors...")
-        haptic.send_stop()
+        haptic.stop()
         time.sleep(0.1)
         sensor.stop()
-        haptic.stop()
+        haptic.disconnect()
         keys.stop()
         logger.close()
 
@@ -455,7 +416,10 @@ def run_sensor_only_mode(args):
 
 
 def run_simulate_mode(args):
-    haptic = HapticLink(args.haptic_port)
+    haptic = get_transport(args.transport, port=args.haptic_port)
+    if not haptic.connect():
+        print(f"[WARN] Could not connect haptic transport '{args.transport}' — "
+              f"the on-screen preview will still run, but no real motors will move.")
     cfg = load_or_default_config(args.calibration_file)
 
     synthetic_sequence = [0, 5, 10, 25, 50, 80, 100]
@@ -490,15 +454,15 @@ def run_simulate_mode(args):
                 if now - last_haptic_send >= 1.0 / HAPTIC_SEND_HZ:
                     last_haptic_send = now
                     motors, _ = encoder.update(sample)
-                    haptic.send_motors(motors)
+                    haptic.send_motor_command(MotorCommand.from_list(motors))
                 time.sleep(MAIN_LOOP_SLEEP_S)
     except KeyboardInterrupt:
         pass
     finally:
         print("\nSimulation done. Stopping all motors...")
-        haptic.send_stop()
-        time.sleep(0.1)
         haptic.stop()
+        time.sleep(0.1)
+        haptic.disconnect()
 
 
 # ======================================================================
@@ -516,19 +480,27 @@ def main():
                          help="Path to calibration.json (default: calibration.json)")
     parser.add_argument("--calibrate", action="store_true",
                          help="Run the guided calibration wizard before starting (requires --sensor-port)")
+    parser.add_argument("--transport", default=get_default_transport_name(),
+                         choices=["usb", "wifi", "ble", "bluetooth", "espnow"],
+                         help="Haptic ESP32 transport (default: usb, or $TRANSPORT env var). "
+                              "wifi/ble/espnow read host/device config from pc/.env or "
+                              "pc/local_config.json — see .env.example. USB is the only "
+                              "transport tested against real hardware; see docs/transport-options.md.")
     args = parser.parse_args()
 
     if args.simulate:
-        if not args.haptic_port:
-            parser.error("--simulate requires --haptic-port")
+        if args.transport == "usb" and not args.haptic_port:
+            parser.error("--simulate with --transport usb requires --haptic-port")
         run_simulate_mode(args)
     elif args.sensor_only:
         if not args.sensor_port:
             parser.error("--sensor-only requires --sensor-port")
         run_sensor_only_mode(args)
     else:
-        if not args.sensor_port or not args.haptic_port:
-            parser.error("full mode requires both --sensor-port and --haptic-port (or use --simulate / --sensor-only)")
+        if not args.sensor_port:
+            parser.error("full mode requires --sensor-port (or use --simulate / --sensor-only)")
+        if args.transport == "usb" and not args.haptic_port:
+            parser.error("full mode with --transport usb requires --haptic-port")
         run_full_mode(args)
 
 

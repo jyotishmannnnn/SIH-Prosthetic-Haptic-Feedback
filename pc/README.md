@@ -1,6 +1,26 @@
 # PC layer
 
-Two files:
+## Transport layer (`transports/`)
+
+PC -> Haptic ESP32 communication goes through a transport abstraction so
+`haptic_algorithm.py` never needs to know how commands get to the
+hardware. See `transports/base.py` (`HapticTransport` interface,
+`MotorCommand`) and `../docs/transport-options.md` /
+`../docs/wireless-setup.md` for the full design and comparison.
+
+| Transport | File | Status |
+|---|---|---|
+| USB Serial | `transports/usb_serial.py` | **Working, tested.** Direct refactor of the original serial code, same protocol/behavior. |
+| Wi-Fi (UDP) | `transports/wifi.py` | Implemented, **not tested** — no matching ESP32 firmware exists yet. |
+| Bluetooth LE | `transports/bluetooth.py` | Implemented (needs `bleak`), **not tested** — no matching ESP32 firmware exists yet. |
+| ESP-NOW | `transports/espnow.py` | **Stub only** — PC can't speak ESP-NOW directly, needs a gateway firmware (not built). See the module docstring. |
+
+Select at runtime with `--transport {usb,wifi,ble,espnow}` (default
+`usb`, or set `$TRANSPORT`). Wi-Fi/BLE connection details (host, port,
+device name) come from `pc/.env` (copy from `.env.example`) or
+`pc/local_config.json` — both git-ignored, never commit real values.
+
+Two files make up the rest of the PC layer:
 
 - **`haptic_algorithm.py`** — the actual tactile-processing and
   haptic-encoding algorithm (baseline subtraction, filtering, feature

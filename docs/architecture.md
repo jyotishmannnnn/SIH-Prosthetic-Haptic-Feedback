@@ -64,25 +64,66 @@ onto an MCU later once the encoding is validated (see `docs/haptic-algorithm.md`
 
 ### Haptic ESP32-S3 (`firmware/haptic-controller/haptic_controller_v1/`)
 Receives `M,<m0>,<m1>,<m2>,<m3>,<m4>,<m5>` / `S` / `PING` / `STATUS` over
-USB serial and drives 6 PWM outputs through a transistor/MOSFET driver
-stage (see `docs/hardware.md` for the assumed driver circuit). It does
-**not** read the MLX90393 and has no knowledge of the tactile algorithm —
-it just executes motor commands.
+USB serial and drives 6 PWM outputs through the bench-verified CPN2222A
+driver stage (see `docs/hardware.md`). It does **not** read the MLX90393
+and has no knowledge of the tactile algorithm — it just executes motor
+commands.
 
 It owns a **communication watchdog**: if no valid `M,`/`S` command
 arrives within `COMM_TIMEOUT_MS` (500 ms in the current firmware), it
 zeroes all motors immediately. This is the primary failsafe against a PC
-crash, Python crash, or USB disconnect during a demo.
+crash, Python crash, or USB disconnect during a demo. **Every transport
+below relies on this same watchdog** — it's implemented once, in
+firmware, independent of how the command arrived.
+
+## Transport layer (PC -> Haptic ESP32)
+
+The PC side of this link goes through a transport abstraction
+(`pc/transports/`, see `docs/transport-options.md` for the full
+comparison) so `pc/haptic_algorithm.py` never needs to know how a
+`MotorCommand` reaches the Haptic ESP32. Four transports are defined;
+only USB is implemented in firmware today.
+
+**USB mode (current, working):**
+```
+PC -> USB -> Haptic ESP32 -> Motors
+```
+
+**Wi-Fi mode (PC client implemented, NOT TESTED, no matching firmware yet):**
+```
+PC -> Wi-Fi (UDP) -> Haptic ESP32 -> Motors
+```
+
+**Bluetooth/BLE mode (PC client implemented, NOT TESTED, no matching firmware yet):**
+```
+PC -> BLE (GATT write) -> Haptic ESP32 -> Motors
+```
+
+**ESP-NOW mode (architectural stub only, not implemented):**
+```
+PC -> USB -> Sensor ESP32 (acting as a gateway) -> ESP-NOW -> Haptic ESP32 -> Motors
+```
+This is the only mode where the Sensor ESP32 does double duty — the PC
+cannot speak ESP-NOW directly (see `docs/transport-options.md`). This
+does **not** change what the Sensor ESP32's current firmware does; it
+would require new gateway functionality that has not been built.
+
+All four modes produce the exact same wire-level command as today
+(`M,<m0>..<m5>` / `S`) — nothing about the haptic algorithm, motor
+mapping, or PWM values changes based on transport.
 
 ## Communication boundaries
 
 - Sensor ESP32 <-> PC: one-directional data stream (`S,...`), fault
   reporting only (`F,...`). No commands flow PC -> Sensor ESP32.
 - PC <-> Haptic ESP32: one-directional command stream (`M,...` / `S`),
-  with `PING`/`STATUS` for diagnostics. No sensor data flows through this
-  link.
-- The two ESP32 boards never talk to each other directly. All
-  coordination happens on the PC.
+  with `PING`/`STATUS` for diagnostics, over whichever transport is
+  selected (USB today; see "Transport layer" above). No sensor data
+  flows through this link regardless of transport.
+- The two ESP32 boards never talk to each other directly today. The only
+  planned exception is the not-yet-built ESP-NOW gateway mode, where the
+  Sensor ESP32 would relay PC commands to the Haptic ESP32 — see
+  `docs/transport-options.md`. All coordination happens on the PC today.
 
 See `docs/serial-protocol.md` for exact wire formats.
 

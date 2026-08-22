@@ -1,1 +1,5 @@
 pyserial>=3.5
+
+# Optional, only needed for --transport ble (transports/bluetooth.py).
+# Not installed by default so a USB-only setup stays lightweight.
+# pip install bleak

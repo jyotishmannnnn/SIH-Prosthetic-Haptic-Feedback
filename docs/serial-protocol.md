@@ -1,7 +1,20 @@
 # Serial protocol
 
 Two independent USB-serial links, both at **115200 baud, 8N1**. The two
-ESP32 boards never talk to each other — everything routes through the PC.
+ESP32 boards never talk to each other today — everything routes through
+the PC (see `docs/architecture.md` for the one planned exception, an
+ESP-NOW gateway mode, not yet implemented).
+
+**This document describes the wire format, not just the USB transport.**
+The PC -> Haptic ESP32 command set (`M,`/`S`/`PING`/`STATUS`) is the same
+ASCII text regardless of which transport carries it — USB serial bytes,
+a Wi-Fi UDP datagram, or a BLE characteristic write all use the exact
+same strings, generated from one place
+(`pc/transports/base.py:format_motor_command()`/`format_stop()`) so they
+can never drift apart. See `docs/transport-options.md` for the transport
+comparison and `docs/wireless-setup.md` for the wireless-specific
+framing notes (e.g. UDP needs no newline terminator, unlike the serial
+byte stream below).
 
 ## Sensor ESP32 -> PC
 

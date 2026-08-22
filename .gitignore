@@ -23,6 +23,7 @@ logs/
 # Local configuration / calibration output
 .env
 calibration.json
+local_config.json
 
 # Arduino build artifacts
 *.hex
